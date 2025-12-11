@@ -1,0 +1,35 @@
+name: nhmrc
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  # - nvidia::cudatoolkit=11.8
+  - numpy
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8
+  - scipy
+  - pandas
+  - ipdb
+  - scikit-learn
+  - scikit-image
+  - h5py
+  - seaborn
+  - imageio
+  - matplotlib
+  - opencv
+  - librosa
+  - pynput
+  - pip
+  - pip:
+      - pyrealsense2
+      - ultralytics        # YOLOv5/YOLOv8/YOLOv9 Python package
+      - ffmpeg-python      # useful for network-streaming pipelines
+      - pysofaconventions
+      - soundfile
+      - sounddevice
+      - python-osc
