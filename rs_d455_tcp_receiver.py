@@ -85,6 +85,7 @@ def handle_client(conn: socket.socket):
 
 def main():
     host = "0.0.0.0"  # listen on all interfaces
+    # host = "192.168.0.1"
     port = 50000
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
