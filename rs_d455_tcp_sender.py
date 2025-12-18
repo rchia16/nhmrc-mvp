@@ -9,6 +9,78 @@ import numpy as np
 import pyrealsense2 as rs
 import cv2
 
+class IMUReader:
+    """Reads accel/gyro directly from the Motion Module sensor via callback."""
+    def __init__(self, device: rs.device, accel_hz=250, gyro_hz=400):
+        self.lock = threading.Lock()
+        self.accel = None
+        self.gyro = None
+
+        # Find a sensor that actually has accel/gyro profiles (don't rely on name)
+        self.motion_sensor = None
+        for s in device.query_sensors():
+            has_accel = False
+            has_gyro = False
+            for p in s.get_stream_profiles():
+                if p.stream_type() == rs.stream.accel:
+                    has_accel = True
+                elif p.stream_type() == rs.stream.gyro:
+                    has_gyro = True
+            if has_accel and has_gyro:
+                self.motion_sensor = s
+                break
+
+        if self.motion_sensor is None:
+            # Helpful debug: list sensor names we did see
+            names = []
+            for s in device.query_sensors():
+                try:
+                    names.append(s.get_info(rs.camera_info.name))
+                except Exception:
+                    names.append("<unknown>")
+            raise RuntimeError(f"No accel+gyro sensor found. Sensors seen: {names}")
+
+        # Select stream profiles that match supported rates
+        accel_prof = None
+        gyro_prof = None
+        for p in self.motion_sensor.get_stream_profiles():
+            if p.stream_type() == rs.stream.accel and p.format() == rs.format.motion_xyz32f and p.fps() == accel_hz:
+                accel_prof = p
+            if p.stream_type() == rs.stream.gyro and p.format() == rs.format.motion_xyz32f and p.fps() == gyro_hz:
+                gyro_prof = p
+
+        if accel_prof is None or gyro_prof is None:
+            raise RuntimeError(f"Could not find accel@{accel_hz} and gyro@{gyro_hz} motion profiles")
+
+        self.motion_sensor.open([accel_prof, gyro_prof])
+        self.motion_sensor.start(self._cb)
+
+    def _cb(self, f):
+        if not f.is_motion_frame():
+            return
+        m = f.as_motion_frame()
+        data = m.get_motion_data()
+        st = m.get_profile().stream_type()
+        with self.lock:
+            if st == rs.stream.accel:
+                self.accel = (data.x, data.y, data.z)
+            elif st == rs.stream.gyro:
+                self.gyro = (data.x, data.y, data.z)
+
+    def get_latest(self):
+        with self.lock:
+            return self.accel, self.gyro
+
+    def stop(self):
+        try:
+            self.motion_sensor.stop()
+        except Exception:
+            pass
+        try:
+            self.motion_sensor.close()
+        except Exception:
+            pass
+
 
 class RealSenseD455TCPSender:
     """
@@ -51,15 +123,16 @@ class RealSenseD455TCPSender:
         # --- RealSense setup (similar to your YOLO pipeline) ---
         self.pipeline = rs.pipeline()
         self.config = rs.config()
-        self.config.enable_stream(
-            rs.stream.color, self.width, self.height, rs.format.bgr8, self.fps
-        )
-        # IMU streams
-        self.config.enable_stream(rs.stream.accel)
-        self.config.enable_stream(rs.stream.gyro)
+        
+        self.config.enable_stream(rs.stream.color, self.width, self.height,
+                                  rs.format.bgr8, self.fps)
 
         self.profile = self.pipeline.start(self.config)
-        print("RealSense D455 started (color + accel + gyro).")
+        print("RealSense D455 started (color).")
+
+        dev = self.profile.get_device()
+        self.imu_reader = IMUReader(dev, accel_hz=250, gyro_hz=400)
+        print("RealSense D455 started (accel + gyro).")
 
     # ------------------------------------------------------------------
     # Networking helpers
@@ -116,16 +189,13 @@ class RealSenseD455TCPSender:
                 accel_data = None
                 gyro_data = None
 
-                for f in frames:
-                    if f.is_motion_frame():
-                        motion = f.as_motion_frame()
-                        profile = motion.get_profile()
-                        stype = profile.stream_type()
-                        data = motion.get_motion_data()
-                        if stype == rs.stream.accel:
-                            accel_data = (data.x, data.y, data.z)
-                        elif stype == rs.stream.gyro:
-                            gyro_data = (data.x, data.y, data.z)
+                # Get latest IMU sample (independent of frameset)
+                accel_data, gyro_data = (None, None)
+                if getattr(self, "imu_reader", None) is not None:
+                    accel_data, gyro_data = self.imu_reader.get_latest()
+                    # optional debug
+                    # if accel_data or gyro_data:
+                    #     print("accel:", accel_data, "gyro:", gyro_data)
 
                 # Convert color frame to numpy array
                 color_image = np.asanyarray(color_frame.get_data())
@@ -158,6 +228,13 @@ class RealSenseD455TCPSender:
             self.running = False
             print("Stopping RealSense pipeline...")
             self.pipeline.stop()
+
+            if getattr(self, "imu_reader", None) is not None:
+                try:
+                    self.imu_reader.stop()
+                except Exception:
+                    pass
+
             if self.sock is not None:
                 try:
                     self.sock.close()
@@ -182,7 +259,7 @@ class RealSenseD455TCPSender:
 
 def main():
     # CHANGE THIS to your desktop PC's IP address
-    desktop_ip = "192.168.1.100"
+    desktop_ip = "192.168.0.194"
     port = 50000
 
     sender = RealSenseD455TCPSender(
