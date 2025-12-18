@@ -222,12 +222,35 @@ class MAX30102():
 
         return red_led, ir_led
 
-    def i2c_thread_func(self):
-        status = self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_1, 1)
-        if status[0] & 0x80:
-            timestamp = time.time()
+    def i2c_thread_func(self, max_batch=32, require_ppg_rdy=False):
+        """
+        Drain FIFO and return a batch of samples: [(ts, red, ir), ...]
+        Returns None if nothing is available.
+
+        max_batch: cap number of samples per call to keep callback quick
+        require_ppg_rdy: if True, only read when PPG_RDY bit is set
+        """
+        # Read & clear interrupt status (read clears latched bits)
+        status = self.bus.read_i2c_block_data(self.address, REG_INTR_STATUS_1, 1)[0]
+
+        if require_ppg_rdy and not (status & 0x80):
+            return None
+
+        n = self.get_data_present()
+        if n <= 0:
+            return None
+
+        if max_batch is not None:
+            n = min(int(n), int(max_batch))
+
+        t0 = time.time()
+        out = []
+        for _ in range(n):
             red, ir = self.read_fifo()
-            return timestamp, red, ir
+            out.append((t0, red, ir))
+
+        return out
+
 
     def read_sequential(self, amount=None, buffer_add=None, stop_event=None):
         """
@@ -288,44 +311,24 @@ class MAX30102():
             return red_buf, ir_buf
 
     
-    # def read_sequential(self, amount=100):
-    #     """
-    #     This function will read the red-led and ir-led `amount` times.
-    #     This works as blocking function.
-    #     """
-    #     red_buf = []
-    #     ir_buf = []
-    #     count = amount
+    def read_reg(self, reg):
+        return self.bus.read_byte_data(self.address, reg)
 
-    #     while count > 0:
-    #         num_bytes = self.get_data_present()
-    #         while num_bytes > 0:
-    #             red, ir = self.read_fifo()
+    def dump_regs(self):
+        regs = {
+            "INTR_EN1": REG_INTR_ENABLE_1,
+            "INTR_EN2": REG_INTR_ENABLE_2,
+            "FIFO_CFG": REG_FIFO_CONFIG,
+            "MODE_CFG": REG_MODE_CONFIG,
+            "SPO2_CFG": REG_SPO2_CONFIG,
+            "LED1_PA": REG_LED1_PA,
+            "LED2_PA": REG_LED2_PA,
+            "PART_ID": REG_PART_ID,
+            "REV_ID":  REG_REV_ID,
+            "FIFO_WR": REG_FIFO_WR_PTR,
+            "FIFO_RD": REG_FIFO_RD_PTR,
+            "OVF":     REG_OVF_COUNTER,
+        }
+        out = {k: self.read_reg(v) for k, v in regs.items()}
+        return out
 
-    #             red_buf.append(red)
-    #             ir_buf.append(ir)
-    #             num_bytes -= 1
-    #             count -= 1
-
-    #     return red_buf, ir_buf
-
-
-    # def read_sequential(self, amount=100):
-    #     """
-    #     This function will read the red-led and ir-led `amount` times.
-    #     This works as blocking function.
-    #     """
-    #     red_buf = []
-    #     ir_buf = []
-    #     for i in range(amount):
-    #         while(GPIO.input(self.interrupt) == 1):
-    #             # wait for interrupt signal, which means the data is available
-    #             # do nothing here
-    #             pass
-
-    #         red, ir = self.read_fifo()
-
-    #         red_buf.append(red)
-    #         ir_buf.append(ir)
-
-    #     return red_buf, ir_buf

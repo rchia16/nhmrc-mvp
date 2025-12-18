@@ -209,12 +209,16 @@ class TCPPPGSender:
 
 
 class MAX30102PPGStream:
-    """Owns the MAX30102 device and GPIO interrupt callback."""
     def __init__(self, buffer: RingBuffer, spooler: SampleSpooler,
-                 rate_monitor: RateMonitor):
+                 rate_monitor: RateMonitor, force_poll: bool = False,
+                 no_data_timeout: float = 5.0, poll_sleep_ms: float=5.0):
         self.buffer = buffer
         self.spooler = spooler
         self.rate_monitor = rate_monitor
+        self.force_poll = force_poll
+        self.no_data_timeout = float(no_data_timeout)
+        self.poll_sleep_ms = poll_sleep_ms
+
         self.m = max30102.MAX30102()
         self.m.setup(
             led_mode=0x03,
@@ -227,31 +231,102 @@ class MAX30102PPGStream:
         )
 
         self._running = False
+        self._poll_thread = None
+        self._last_sample_time = time.time()
+        # self._drain_event = threading.Event()
+        # self._drain_thread = None
+
 
     def start(self):
         if self._running:
             return
         self._running = True
-        GPIO.add_event_detect(self.m.interrupt, GPIO.FALLING, callback=self._gpio_callback)
+
+        if self.force_poll:
+            print("[PPG] Using FIFO polling mode (force)")
+            self._poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
+            self._poll_thread.start()
+        else:
+            # Start a FIFO drain worker
+            self._drain_thread = threading.Thread(target=self._drain_loop, daemon=True)
+            self._drain_thread.start()
+
+            # Trigger on BOTH to avoid missing transitions
+            GPIO.add_event_detect(self.m.interrupt, GPIO.BOTH, callback=self._irq_callback, bouncetime=1)
+
+            # watchdog stays
+            self._poll_thread = threading.Thread(target=self._watchdog_loop, daemon=True)
+            self._poll_thread.start()
+
+    def _irq_callback(self, channel):
+        # Keep GPIO callback ultra-fast: just wake the drain thread
+        self._drain_event.set()
+
+    def _drain_loop(self):
+        while self._running:
+            # Wait until an interrupt occurs (or wake periodically)
+            self._drain_event.wait(timeout=0.5)
+            self._drain_event.clear()
+
+            try:
+                # Drain until FIFO empty
+                while True:
+                    batch = self.m.i2c_thread_func(max_batch=32, require_ppg_rdy=False)
+                    if not batch:
+                        break
+                    self._handle_batch(batch)
+            except Exception as e:
+                print(f"[DRAIN] ERROR: {e}")
+
 
     def stop(self):
         if not self._running:
             return
-        GPIO.remove_event_detect(self.m.interrupt)
+        if not self.force_poll:
+            GPIO.remove_event_detect(self.m.interrupt)
+        self._drain_event.set()
         self._running = False
 
-    def _gpio_callback(self, channel):
-        batch = self.m.i2c_thread_func(max_batch=32)
+
+    def _handle_batch(self, batch):
         if not batch:
             return
-
-        # record rate based on actual samples
+        self._last_sample_time = time.time()
         self.rate_monitor.add(len(batch))
-
         for sample in batch:
             self.buffer.append(sample)
             self.spooler.enqueue(sample)
 
+    def _gpio_callback(self, channel):
+        try:
+            batch = self.m.i2c_thread_func(max_batch=32, require_ppg_rdy=False)
+            self._handle_batch(batch)
+        except Exception as e:
+            print(f"[GPIO_CB] ERROR: {e}")
+
+    def _poll_loop(self):
+        # Poll FIFO regardless of interrupts. Great for debugging.
+        while self._running:
+            try:
+                batch = self.m.i2c_thread_func(max_batch=32, require_ppg_rdy=False)
+                self._handle_batch(batch)
+            except Exception as e:
+                print(f"[POLL] ERROR: {e}")
+            time.sleep(self.poll_sleep_ms/1000.0) # adjust if you push SR very high
+
+    def _watchdog_loop(self):
+        # If no samples arrive for N seconds, print useful diagnostics
+        while self._running:
+            if (time.time() - self._last_sample_time) > self.no_data_timeout:
+                try:
+                    level = GPIO.input(self.m.interrupt)
+                    n = self.m.get_data_present()
+                    regs = self.m.dump_regs()
+                    print(f"[PPG][NO DATA] INT level={level} FIFO_samples={n} regs={regs}")
+                except Exception as e:
+                    print(f"[PPG][NO DATA] diagnostics failed: {e}")
+                self._last_sample_time = time.time()
+            time.sleep(0.2)
 
 
 class RealtimePlotter:
@@ -313,6 +388,9 @@ class App:
         rotate_every_seconds,
         fsync_every,
         rate_print,
+        force_poll,
+        no_data_timeout,
+        poll_sleep_ms,
     ):
         self.no_plot = no_plot
 
@@ -336,8 +414,12 @@ class App:
         self.stream = MAX30102PPGStream(
             self.buffer,
             spooler=self.spooler,
-            rate_monitor=self.rate_monitor
+            rate_monitor=self.rate_monitor,
+            force_poll=force_poll,
+            no_data_timeout=no_data_timeout,
+            poll_sleep_ms=poll_sleep_ms,
         )
+
 
         self.plotter = None if no_plot else RealtimePlotter(
             plot_window, drain_fn=self.buffer.drain)
@@ -401,6 +483,13 @@ def main():
                    action="store_true",
                    help="Print effective sampling rate every ~2 seconds"
                   )
+    p.add_argument("--force-poll", action="store_true",
+               help="Ignore GPIO interrupts and poll FIFO in a loop (debug / headless robustness).")
+    p.add_argument("--no-data-timeout", type=float, default=5.0,
+                   help="Print diagnostics if no samples arrive for this many seconds.")
+    p.add_argument("--poll-sleep-ms", type=float, default=5.0,
+               help="Polling sleep interval in ms (only used with --force-poll).")
+
 
 
     args = p.parse_args()
@@ -414,6 +503,9 @@ def main():
         args.rotate_seconds,
         args.fsync_every,
         args.rate_print,
+        args.force_poll,
+        args.no_data_timeout,
+        args.poll_sleep_ms,
     ).run()
 
 
