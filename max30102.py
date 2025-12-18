@@ -87,40 +87,103 @@ class MAX30102():
         """
         self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [0x40])
 
-    def setup(self, led_mode=0x03): # default: 0x03
+    def setup(
+        self,
+        led_mode=0x03,
+        sample_rate=100,
+        pulse_width=411,
+        adc_range=4096,
+        fifo_average=4,
+        fifo_rollover=False,
+        fifo_a_full=17,
+        led1_pa=0x24,
+        led2_pa=0x24,
+        pilot_pa=0x7f,
+    ):
         """
-        This will setup the device with the values written in sample Arduino code.
+        Configure MAX30102.
+
+        led_mode:
+            0x02 = HR only (Red)
+            0x03 = SpO2 (Red + IR)
+            0x07 = Multi-LED mode
+
+        sample_rate (Hz): 50, 100, 200, 400, 800, 1000, 1600, 3200
+        pulse_width (us): 69, 118, 215, 411
+        adc_range (nA):   2048, 4096, 8192, 16384
+        fifo_average:     1,2,4,8,16,32
+        fifo_a_full:      0..31  
+            (interrupt when FIFO has this many empty spaces left;
+            datasheet wording varies)
         """
-        # INTR setting
-        # 0xc0 : A_FULL_EN and PPG_RDY_EN = Interrupt will be triggered when
-        # fifo almost full & new fifo data ready
-        # self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_1, [0xc0])
-        self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_1, [0x80])
+
+        # --------------------
+        # Interrupt enables
+        # --------------------
+        # 0x80: PPG_RDY_EN only (your current behavior)
+        # 0xC0: A_FULL + PPG_RDY 
+        self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_1, [0xC0])
+        # self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_1, [0x80])
         self.bus.write_i2c_block_data(self.address, REG_INTR_ENABLE_2, [0x00])
 
-        # FIFO_WR_PTR[4:0]
+        # --------------------
+        # FIFO pointers reset
+        # --------------------
         self.bus.write_i2c_block_data(self.address, REG_FIFO_WR_PTR, [0x00])
-        # OVF_COUNTER[4:0]
         self.bus.write_i2c_block_data(self.address, REG_OVF_COUNTER, [0x00])
-        # FIFO_RD_PTR[4:0]
         self.bus.write_i2c_block_data(self.address, REG_FIFO_RD_PTR, [0x00])
 
-        # 0b 0100 1111
-        # sample avg = 4, fifo rollover = false, fifo almost full = 17
-        self.bus.write_i2c_block_data(self.address, REG_FIFO_CONFIG, [0x4f])
+        # --------------------
+        # FIFO config register (0x08)
+        # [7:5] SMP_AVE, [4] FIFO_ROLLOVER_EN, [3:0] FIFO_A_FULL (actually 5 bits per datasheet,
+        # but many libs use 4 LSBs. Here we keep behavior compatible with your original 0x4F.)
+        # Your original: 0x4F => avg=4, rollover=0, a_full=15
+        # --------------------
+        ave_map = {1: 0b000, 2: 0b001, 4: 0b010, 8: 0b011, 16: 0b100, 32: 0b101}
+        if fifo_average not in ave_map:
+            raise ValueError("fifo_average must be one of: 1,2,4,8,16,32")
+        smp_ave = ave_map[fifo_average] << 5
 
-        # 0x02 for read-only, 0x03 for SpO2 mode, 0x07 multimode LED
+        rollover = (1 << 4) if fifo_rollover else 0
+
+        # Keep in 0..15 to match your prior style (0x4F used 0x0F).
+        # If you want full 0..31 support, we can rework this to use 5 bits.
+        a_full = int(fifo_a_full) & 0x0F
+
+        fifo_cfg = smp_ave | rollover | a_full
+        self.bus.write_i2c_block_data(self.address, REG_FIFO_CONFIG, [fifo_cfg])
+
+        # --------------------
+        # Mode config (0x09)
+        # --------------------
         self.bus.write_i2c_block_data(self.address, REG_MODE_CONFIG, [led_mode])
-        # 0b 0010 0111
-        # SPO2_ADC range = 4096nA, SPO2 sample rate = 100Hz, LED pulse-width = 411uS
-        self.bus.write_i2c_block_data(self.address, REG_SPO2_CONFIG, [0x27])
 
-        # choose value for ~7mA for LED1
-        self.bus.write_i2c_block_data(self.address, REG_LED1_PA, [0x24])
-        # choose value for ~7mA for LED2
-        self.bus.write_i2c_block_data(self.address, REG_LED2_PA, [0x24])
-        # choose value fro ~25mA for Pilot LED
-        self.bus.write_i2c_block_data(self.address, REG_PILOT_PA, [0x7f])
+        # --------------------
+        # SPO2 config register (0x0A)
+        # [6:5] ADC_RGE, [4:2] SR, [1:0] PW
+        # Your original 0x27 => range=4096, SR=100, PW=411us
+        # --------------------
+        adc_map = {2048: 0b00, 4096: 0b01, 8192: 0b10, 16384: 0b11}
+        sr_map = {50: 0b000, 100: 0b001, 200: 0b010, 400: 0b011, 800: 0b100, 1000: 0b101, 1600: 0b110, 3200: 0b111}
+        pw_map = {69: 0b00, 118: 0b01, 215: 0b10, 411: 0b11}
+
+        if adc_range not in adc_map:
+            raise ValueError("adc_range must be one of: 2048,4096,8192,16384")
+        if sample_rate not in sr_map:
+            raise ValueError("sample_rate must be one of: 50,100,200,400,800,1000,1600,3200")
+        if pulse_width not in pw_map:
+            raise ValueError("pulse_width must be one of: 69,118,215,411")
+
+        spo2_cfg = (adc_map[adc_range] << 5) | (sr_map[sample_rate] << 2) | pw_map[pulse_width]
+        self.bus.write_i2c_block_data(self.address, REG_SPO2_CONFIG, [spo2_cfg])
+
+        # --------------------
+        # LED currents
+        # --------------------
+        self.bus.write_i2c_block_data(self.address, REG_LED1_PA, [int(led1_pa) & 0xFF])
+        self.bus.write_i2c_block_data(self.address, REG_LED2_PA, [int(led2_pa) & 0xFF])
+        self.bus.write_i2c_block_data(self.address, REG_PILOT_PA, [int(pilot_pa) & 0xFF])
+
 
     # this won't validate the arguments!
     # use when changing the values from default

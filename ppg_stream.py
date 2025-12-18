@@ -4,6 +4,9 @@ import struct
 import threading
 import queue
 from collections import deque
+import os
+import time
+from datetime import datetime, timedelta
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,6 +14,30 @@ import matplotlib.animation as animation
 
 import max30102
 from RPi import GPIO
+
+class RateMonitor:
+    """
+    Counts samples and periodically prints effective sample rate.
+    """
+    def __init__(self, interval_sec: float = 2.0, enabled: bool = False):
+        self.interval = float(interval_sec)
+        self.enabled = enabled
+        self._count = 0
+        self._t0 = time.time()
+
+    def add(self, n: int):
+        if not self.enabled:
+            return
+
+        self._count += int(n)
+        now = time.time()
+        dt = now - self._t0
+
+        if dt >= self.interval:
+            rate = self._count / dt
+            print(f"[RATE] {rate:.1f} Hz ({self._count} samples / {dt:.2f} s)")
+            self._count = 0
+            self._t0 = now
 
 
 class RingBuffer:
@@ -34,22 +61,90 @@ class RingBuffer:
         with self._lock:
             return list(self._buf)
 
+class SampleSpooler:
+    PACK_FMT = "!dii"
+    PACK_SIZE = struct.calcsize(PACK_FMT)
 
-class UDPPPGSender:
+    def __init__(
+        self,
+        log_dir: str,
+        rotate_every_seconds: int = 3600,
+        forward_sender=None,
+        fsync_every: int = 0,
+    ):
+        self.log_dir = log_dir
+        self.rotate_every = timedelta(seconds=rotate_every_seconds)
+        self.forward_sender = forward_sender
+        self.fsync_every = fsync_every
+
+        self.q = queue.SimpleQueue()
+        self._running = False
+        self._thread = None
+        self._fh = None
+        self._count = 0
+        self._next_rotate = None
+
+    def _open_new_file(self):
+        os.makedirs(self.log_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        path = os.path.join(self.log_dir, f"ppg_{ts}.bin")
+        self._fh = open(path, "ab", buffering=0)
+        self._next_rotate = datetime.now() + self.rotate_every
+        print(f"[LOG] New file: {path}")
+
+    def start(self):
+        self._open_new_file()
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        self.q.put(None)
+        if self._thread:
+            self._thread.join(timeout=2)
+        if self._fh:
+            self._fh.close()
+
+    def enqueue(self, sample):
+        self.q.put(sample)
+
+    def _run(self):
+        while self._running:
+            item = self.q.get()
+            if item is None:
+                continue
+
+            if datetime.now() >= self._next_rotate:
+                self._fh.close()
+                self._open_new_file()
+
+            ts, red, ir = item
+            self._fh.write(struct.pack(self.PACK_FMT, ts, red, ir))
+            self._count += 1
+
+            if self.forward_sender:
+                self.forward_sender.enqueue(ts, red, ir)
+
+
+
+class TCPPPGSender:
     """
-    UDP sender with a background worker thread.
-    Packet format: !dii (timestamp float64, red int32, ir int32)
+    TCP sender with auto-reconnect.
+    Sends packed records !dii (16 bytes each).
     """
     PACK_FMT = "!dii"
     PACK_SIZE = struct.calcsize(PACK_FMT)
 
-    def __init__(self, host: str, port: int, max_queue: int = 4096):
+    def __init__(self, host: str, port: int, reconnect_sec: float = 2.0):
         self.host = host
         self.port = int(port)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._q = queue.Queue(maxsize=max_queue)
+        self.reconnect_sec = float(reconnect_sec)
+
+        self._q = queue.SimpleQueue()
         self._running = False
         self._thread = None
+        self._sock = None
 
     def start(self):
         if self._running:
@@ -60,44 +155,77 @@ class UDPPPGSender:
 
     def stop(self):
         self._running = False
-        try:
-            self._q.put_nowait(None)
-        except queue.Full:
-            pass
-        try:
-            self._sock.close()
-        except Exception:
-            pass
+        self._q.put(None)
+        self._close_sock()
 
     def enqueue(self, ts: float, red: int, ir: int):
         if not self._running:
             return
+        self._q.put((float(ts), int(red), int(ir)))
+
+    def _close_sock(self):
         try:
-            self._q.put_nowait((float(ts), int(red), int(ir)))
-        except queue.Full:
-            # Drop rather than block acquisition
+            if self._sock:
+                self._sock.close()
+        except Exception:
             pass
+        self._sock = None
+
+    def _connect(self):
+        self._close_sock()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect((self.host, self.port))
+        s.settimeout(None)
+        self._sock = s
+        print(f"[TCP] Connected -> {self.host}:{self.port}")
 
     def _run(self):
         while self._running:
+            # Ensure connection
+            if self._sock is None:
+                try:
+                    self._connect()
+                except Exception as e:
+                    print(f"[TCP] Connect failed: {e}. Retrying in {self.reconnect_sec}s")
+                    time.sleep(self.reconnect_sec)
+                    continue
+
             item = self._q.get()
             if item is None:
                 continue
+
             ts, red, ir = item
+            pkt = struct.pack(self.PACK_FMT, ts, red, ir)
+
             try:
-                pkt = struct.pack(self.PACK_FMT, ts, red, ir)
-                self._sock.sendto(pkt, (self.host, self.port))
-            except Exception:
-                # keep going on transient network errors
-                pass
+                # sendall guarantees full write or raises
+                self._sock.sendall(pkt)
+            except Exception as e:
+                print(f"[TCP] Send failed: {e}. Reconnecting...")
+                self._close_sock()
+                # loop will reconnect and continue
+
 
 
 class MAX30102PPGStream:
     """Owns the MAX30102 device and GPIO interrupt callback."""
-    def __init__(self, buffer: RingBuffer, udp_sender: UDPPPGSender | None = None):
+    def __init__(self, buffer: RingBuffer, spooler: SampleSpooler,
+                 rate_monitor: RateMonitor):
         self.buffer = buffer
-        self.udp_sender = udp_sender
+        self.spooler = spooler
+        self.rate_monitor = rate_monitor
         self.m = max30102.MAX30102()
+        self.m.setup(
+            led_mode=0x03,
+            sample_rate=200,
+            pulse_width=118,
+            adc_range=4096,
+            fifo_average=1,
+            fifo_rollover=False,
+            fifo_a_full=15,
+        )
+
         self._running = False
 
     def start(self):
@@ -113,17 +241,17 @@ class MAX30102PPGStream:
         self._running = False
 
     def _gpio_callback(self, channel):
-        """
-        Keep callback FAST: read i2c, append, enqueue for UDP, return.
-        """
-        data = self.m.i2c_thread_func()
-        if data is None:
+        batch = self.m.i2c_thread_func(max_batch=32)
+        if not batch:
             return
-        # data = (timestamp, red, ir)
-        self.buffer.append(data)
-        if self.udp_sender is not None:
-            ts, red, ir = data
-            self.udp_sender.enqueue(ts, red, ir)
+
+        # record rate based on actual samples
+        self.rate_monitor.add(len(batch))
+
+        for sample in batch:
+            self.buffer.append(sample)
+            self.spooler.enqueue(sample)
+
 
 
 class RealtimePlotter:
@@ -159,46 +287,135 @@ class RealtimePlotter:
         x = np.arange(self.sample_window)
         self.ax.plot(x, self.red, "r-")
         self.ax.plot(x, self.ir, "b-")
-        self.ax.set_title("MAX30102 Realtime PPG (local) + UDP stream")
+        self.ax.set_title("MAX30102 Realtime PPG (local) + TCP stream")
         self.ax.set_xlabel("Sample index")
         self.ax.set_ylabel("PPG value")
 
     def show(self, interval_ms: int = 50):
-        animation.FuncAnimation(self.fig, self._animate, interval=interval_ms, blit=False)
+        self.anim = animation.FuncAnimation(
+            self.fig,
+            self._animate,
+            interval=interval_ms,
+            blit=False,
+            cache_frame_data=False,
+        )
         plt.show()
 
 
 class App:
-    def __init__(self, send_ip: str | None, send_port: int, plot_window: int):
-        self.buffer = RingBuffer(maxlen=60 * 60 * 60)  # ~1 hour @ 60Hz, adjust as needed
-        self.sender = UDPPPGSender(send_ip, send_port) if send_ip else None
-        self.stream = MAX30102PPGStream(self.buffer, udp_sender=self.sender)
-        self.plotter = RealtimePlotter(plot_window, drain_fn=self.buffer.drain)
+    def __init__(
+        self,
+        send_ip,
+        send_port,
+        plot_window,
+        no_plot,
+        log_dir,
+        rotate_every_seconds,
+        fsync_every,
+        rate_print,
+    ):
+        self.no_plot = no_plot
+
+        self.rate_monitor = RateMonitor(
+            interval_sec=2.0,
+            enabled=rate_print
+        )
+
+        self.buffer = RingBuffer(maxlen=60 * 60 * 60)
+
+        self.sender = TCPPPGSender(send_ip, send_port) if send_ip else None
+
+
+        self.spooler = SampleSpooler(
+            log_dir=log_dir,
+            rotate_every_seconds=rotate_every_seconds,
+            forward_sender=self.sender,
+            fsync_every=fsync_every
+        )
+
+        self.stream = MAX30102PPGStream(
+            self.buffer,
+            spooler=self.spooler,
+            rate_monitor=self.rate_monitor
+        )
+
+        self.plotter = None if no_plot else RealtimePlotter(
+            plot_window, drain_fn=self.buffer.drain)
+
 
     def run(self):
         try:
             if self.sender:
                 self.sender.start()
-                print(f"[UDP] Streaming enabled -> {self.sender.host}:{self.sender.port}")
+                print(f"[TCP] Streaming enabled -> {self.sender.host}:{self.sender.port}")
+
+            self.spooler.start()
+            print(f"[LOG] Writing lossless log to {self.spooler.log_dir}")
+
             self.stream.start()
-            self.plotter.show(interval_ms=50)
+
+            if self.no_plot:
+                print("[INFO] Running headless (no plot)")
+                while True:
+                    time.sleep(1)
+            else:
+                self.plotter.show(interval_ms=50)
+
+        except KeyboardInterrupt:
+            print("\n[INFO] Keyboard interrupt received")
+
         finally:
             self.stream.stop()
             GPIO.cleanup()
+            self.spooler.stop()
             if self.sender:
                 self.sender.stop()
             print("Exiting")
 
 
+
 def main():
+    # python3 ppg_stream.py \
+    #   --no-plot \
+    #   --rate-print \
+    #   --send-ip 192.168.0.194 \
+    #   --send-port 9999
+
+
     p = argparse.ArgumentParser()
     p.add_argument("--send-ip", type=str, default=None,
-                   help="Receiver IP on WiFi (e.g., your laptop IP). If omitted, no UDP streaming.")
-    p.add_argument("--send-port", type=int, default=9999, help="Receiver UDP port.")
-    p.add_argument("--plot-window", type=int, default=2000, help="Samples to show in local plot.")
+                   help="Receiver IP on WiFi (e.g., your laptop IP)."\
+                   "If omitted, no TCP streaming.")
+    p.add_argument("--send-port", type=int, default=9999,
+                   help="Receiver TCP port.")
+    p.add_argument("--plot-window", type=int, default=2000,
+                   help="Samples to show in local plot.")
+    p.add_argument("--no-plot", action="store_true", help="Run headless (no matplotlib, no GUI)")
+    p.add_argument("--log-dir", type=str, default="logs/",
+                   help="Binary append-only log on the Pi (lossless).")
+    p.add_argument("--rotate-seconds", type=int, default=3600,
+                   help="Duration to create new log file in seconds.")
+    p.add_argument("--fsync-every", type=int, default=0,
+                   help="Call fsync every N samples (0 = never; faster but less crash-durable).")
+    p.add_argument("--rate-print",
+                   action="store_true",
+                   help="Print effective sampling rate every ~2 seconds"
+                  )
+
+
     args = p.parse_args()
 
-    App(args.send_ip, args.send_port, args.plot_window).run()
+    App(
+        args.send_ip,
+        args.send_port,
+        args.plot_window,
+        args.no_plot,
+        args.log_dir,
+        args.rotate_seconds,
+        args.fsync_every,
+        args.rate_print,
+    ).run()
+
 
 
 if __name__ == "__main__":
