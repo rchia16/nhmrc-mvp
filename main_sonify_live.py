@@ -28,6 +28,33 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
     return data
 
 
+def decode_depth_png(depth_png: bytes) -> np.ndarray | None:
+    """Decode a PNG-encoded uint16 depth image (aligned to color)."""
+    if not depth_png:
+        return None
+    arr = np.frombuffer(depth_png, dtype=np.uint8)
+    depth = cv2.imdecode(arr, cv2.IMREAD_UNCHANGED)
+    if depth is None:
+        return None
+    if depth.dtype != np.uint16:
+        depth = depth.astype(np.uint16, copy=False)
+    return depth
+
+
+def depth_at_pixel_m(depth_u16: np.ndarray, depth_scale: float, x_px: int, y_px: int) -> float | None:
+    """Return depth in meters at (x_px, y_px) with bounds check."""
+    if depth_u16 is None:
+        return None
+    h, w = depth_u16.shape[:2]
+    x = int(max(0, min(w - 1, int(x_px))))
+    y = int(max(0, min(h - 1, int(y_px))))
+    d_u = int(depth_u16[y, x])
+    # Common invalid values: 0
+    if d_u <= 0:
+        return None
+    return float(d_u) * float(depth_scale)
+
+
 def prune_older_than(buf: deque, newest_t: float, window_sec: float):
     cutoff = newest_t - window_sec
     while buf and buf[0][0] < cutoff:
@@ -153,12 +180,18 @@ class RealSenseYOLOFromTCP:
 
             # Decode JPEG -> frame
             jpeg_bytes = packet.get("jpeg")
+            depth_png = packet.get("depth_png")
+            depth_scale = float(packet.get("depth_scale", 0.001))
             if not jpeg_bytes:
                 continue
             jpg_array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
             frame = cv2.imdecode(jpg_array, cv2.IMREAD_COLOR)
             if frame is None:
                 continue
+
+            depth_u16 = None
+            if depth_png is not None:
+                depth_u16 = decode_depth_png(depth_png)
 
             self.frame_index += 1
             now = time.time()
@@ -192,9 +225,10 @@ class RealSenseYOLOFromTCP:
                     if not self._is_cid_position_stable(cls_id, x_norm, now):
                         continue
 
-                    # NOTE: depth_m is not available from this TCP packet format.
-                    # We still send the field (as None) to keep message shape consistent.
+                    # Depth at center pixel (meters), if depth is available (aligned to color)
                     depth_m = None
+                    if depth_u16 is not None:
+                        depth_m = depth_at_pixel_m(depth_u16, depth_scale, int(cx), int(cy))
 
                     prev = stable_candidates.get(cls_id)
                     if (prev is None) or (conf > prev["conf"]):
