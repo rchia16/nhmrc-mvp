@@ -127,20 +127,22 @@ class RealSenseD455TCPSender:
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         
-        self.config.enable_stream(rs.stream.depth, self.width,
-                                  self.height, rs.format.z16, self.fps)
+        self.config.enable_stream(rs.stream.color, self.width, self.height,
+                                  rs.format.bgr8, self.fps)
+        self.config.enable_stream(rs.stream.depth, self.width, self.height,
+                                  rs.format.z16, self.fps)
 
-        # Align depth to color so depth pixels correspond to the color image
+        self.profile = self.pipeline.start(self.config)
+        print("RealSense D455 started (color + depth).")
+
         self.align = rs.align(rs.stream.color)
+
 
         # Depth scale (meters per unit)
         depth_sensor = self.profile.get_device().first_depth_sensor()
         self.depth_scale = float(depth_sensor.get_depth_scale())
         print(f"Depth scale: {self.depth_scale} m/unit")
 
-
-        self.profile = self.pipeline.start(self.config)
-        print("RealSense D455 started (color + depth).")
 
         dev = self.profile.get_device()
         self.imu_reader = IMUReader(dev, accel_hz=250, gyro_hz=400)
@@ -251,6 +253,9 @@ class RealSenseD455TCPSender:
                 if self.sock is None:
                     self._connect_socket()
                 self._send_packet(payload)
+                self._sent = getattr(self, "_sent", 0) + 1
+                if self._sent % 30 == 0:
+                    print(f"[SEND] packets={self._sent} payload_bytes={len(payload)}")
 
         except Exception as e:
             print(f"Error in streaming loop: {e}")
