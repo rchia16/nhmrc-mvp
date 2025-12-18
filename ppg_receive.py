@@ -40,28 +40,83 @@ class PPGWindowBuffer:
             return (list(self.ts), list(self.red), list(self.ir))
 
 
-class UDPReceiver:
-    """Non-blocking UDP receiver."""
+class TCPServerReceiver:
+    """
+    TCP server that accepts a single sender at a time.
+    If the sender disconnects, it accepts a new connection (reconnect friendly).
+    """
+    PACK_SIZE = PPGPacketCodec.PACK_SIZE
+
     def __init__(self, listen_ip: str, port: int):
         self.listen_ip = listen_ip
         self.port = int(port)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind((self.listen_ip, self.port))
-        self.sock.setblocking(False)
 
-    def poll(self, max_reads: int = 2000):
-        """Drain up to max_reads packets; yields (ts, red, ir, addr_ip)."""
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._srv.bind((self.listen_ip, self.port))
+        self._srv.listen(1)
+        self._srv.settimeout(1.0)
+
+        self._client = None
+        self._client_addr = None
+        self._buf = bytearray()
+
+    def _close_client(self):
+        try:
+            if self._client:
+                self._client.close()
+        except Exception:
+            pass
+        self._client = None
+        self._client_addr = None
+        self._buf.clear()
+
+    def _accept_if_needed(self):
+        if self._client is not None:
+            return
+        try:
+            c, addr = self._srv.accept()
+        except socket.timeout:
+            return
+        c.settimeout(1.0)
+        self._client = c
+        self._client_addr = addr
+        print(f"[TCP] Client connected: {addr[0]}:{addr[1]}")
+
+    def poll(self, max_records: int = 2000):
+        """
+        Return up to max_records decoded samples.
+        Each sample: (ts, red, ir, src_ip)
+        """
         out = []
-        for _ in range(max_reads):
-            try:
-                data, addr = self.sock.recvfrom(2048)
-            except BlockingIOError:
-                break
-            decoded = PPGPacketCodec.decode(data)
+        self._accept_if_needed()
+        if self._client is None:
+            return out
+
+        try:
+            chunk = self._client.recv(4096)
+            if not chunk:
+                # disconnect
+                print("[TCP] Client disconnected")
+                self._close_client()
+                return out
+            self._buf.extend(chunk)
+        except socket.timeout:
+            return out
+        except Exception:
+            self._close_client()
+            return out
+
+        # parse complete records
+        while len(out) < max_records and len(self._buf) >= self.PACK_SIZE:
+            rec = bytes(self._buf[:self.PACK_SIZE])
+            del self._buf[:self.PACK_SIZE]
+            decoded = PPGPacketCodec.decode(rec)
             if decoded is None:
                 continue
             ts, red, ir = decoded
-            out.append((ts, red, ir, addr[0]))
+            out.append((ts, red, ir, self._client_addr[0]))
+
         return out
 
 
@@ -111,37 +166,39 @@ class PlotSink:
         return self.red_line, self.ir_line
 
     def show(self, interval_ms: int = 50):
-        animation.FuncAnimation(self.fig, self._animate, interval=interval_ms, blit=False)
+        self.anim = animation.FuncAnimation(
+            self.fig, self._animate, interval=interval_ms, blit=False)
         plt.show()
+
 
 
 class ReceiverApp:
     def __init__(self, listen_ip: str, port: int, window_size: int, plot: bool):
-        self.receiver = UDPReceiver(listen_ip, port)
+        self.receiver = TCPServerReceiver(listen_ip, port)
         self.window = PPGWindowBuffer(window_size)
         self.plot_enabled = plot
         self.printer = PrinterSink(every_seconds=0.2)
         self.plotter = PlotSink(self.window) if plot else None
+        self._stop = threading.Event()
 
     def _ingest_loop(self):
-        """Run until plot window closes (or forever in print mode)."""
-        while True:
-            packets = self.receiver.poll(max_reads=2000)
+        while not self._stop.is_set():
+            packets = self.receiver.poll(max_records=2000)
             for ts, red, ir, src_ip in packets:
                 self.window.append(ts, red, ir)
                 if not self.plot_enabled:
                     self.printer.consume(ts, red, ir, src_ip)
-
-            # light sleep to avoid pegging a core
             time.sleep(0.001)
 
     def run(self):
-        print(f"[UDP] Listening on {self.receiver.listen_ip}:{self.receiver.port}")
+        print(f"[TCP] Listening on {self.receiver.listen_ip}:{self.receiver.port}")
         if self.plot_enabled:
-            # ingest in background while matplotlib owns the main thread
             t = threading.Thread(target=self._ingest_loop, daemon=True)
             t.start()
-            self.plotter.show(interval_ms=50)
+            try:
+                self.plotter.show(interval_ms=50)
+            finally:
+                self._stop.set()
         else:
             self._ingest_loop()
 
