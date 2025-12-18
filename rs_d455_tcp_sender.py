@@ -93,6 +93,9 @@ class RealSenseD455TCPSender:
         {
             "t": float (timestamp),
             "jpeg": bytes (encoded color frame),
+            "depth_png": bytes (PNG-encoded uint16 depth frame, aligned to color),
+            "depth_scale": float (meters per depth unit),
+            "depth_wh": (w, h),
             "imu": {
                 "accel": (ax, ay, az) or None,
                 "gyro": (gx, gy, gz) or None,
@@ -124,11 +127,20 @@ class RealSenseD455TCPSender:
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         
-        self.config.enable_stream(rs.stream.color, self.width, self.height,
-                                  rs.format.bgr8, self.fps)
+        self.config.enable_stream(rs.stream.depth, self.width,
+                                  self.height, rs.format.z16, self.fps)
+
+        # Align depth to color so depth pixels correspond to the color image
+        self.align = rs.align(rs.stream.color)
+
+        # Depth scale (meters per unit)
+        depth_sensor = self.profile.get_device().first_depth_sensor()
+        self.depth_scale = float(depth_sensor.get_depth_scale())
+        print(f"Depth scale: {self.depth_scale} m/unit")
+
 
         self.profile = self.pipeline.start(self.config)
-        print("RealSense D455 started (color).")
+        print("RealSense D455 started (color + depth).")
 
         dev = self.profile.get_device()
         self.imu_reader = IMUReader(dev, accel_hz=250, gyro_hz=400)
@@ -181,9 +193,14 @@ class RealSenseD455TCPSender:
                 if frames is None:
                     continue
 
+                # Align depth to color
+                frames = self.align.process(frames)
+
                 color_frame = frames.get_color_frame()
-                if not color_frame:
+                depth_frame = frames.get_depth_frame()
+                if not color_frame or not depth_frame:
                     continue
+
 
                 # Collect IMU samples (accel + gyro) from this frameset
                 accel_data = None
@@ -199,6 +216,16 @@ class RealSenseD455TCPSender:
 
                 # Convert color frame to numpy array
                 color_image = np.asanyarray(color_frame.get_data())
+                depth_image = np.asanyarray(depth_frame.get_data())  # uint16 (z16)
+                # Depth compression: 16-bit PNG (lossless)
+                # 0..9 (higher = smaller/slower)
+                png_params = [int(cv2.IMWRITE_PNG_COMPRESSION), 3]   
+                ok_d, enc_d = cv2.imencode(".png", depth_image, png_params)
+                if not ok_d:
+                    print("Failed to encode depth as PNG.")
+                    continue
+                depth_png_bytes = enc_d.tobytes()
+
 
                 # JPEG encode to shrink bandwidth
                 encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
@@ -211,6 +238,9 @@ class RealSenseD455TCPSender:
                 packet = {
                     "t": time.time(),
                     "jpeg": jpeg_bytes,
+                    "depth_png": depth_png_bytes,
+                    "depth_scale": self.depth_scale,
+                    "depth_wh": (int(self.width), int(self.height)),
                     "imu": {
                         "accel": accel_data,
                         "gyro": gyro_data,
