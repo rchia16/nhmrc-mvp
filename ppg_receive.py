@@ -120,6 +120,22 @@ class TCPServerReceiver:
         return out
 
 
+class RateMonitor:
+    def __init__(self, interval_sec: float = 2.0):
+        self.interval = float(interval_sec)
+        self._count = 0
+        self._t0 = time.time()
+
+    def add(self, n: int):
+        self._count += int(n)
+        now = time.time()
+        dt = now - self._t0
+        if dt >= self.interval:
+            print(f"[RX RATE] {self._count/dt:.1f} Hz ({self._count} samples / {dt:.2f} s)")
+            self._count = 0
+            self._t0 = now
+
+
 class PrinterSink:
     """Throttled console printing."""
     def __init__(self, every_seconds: float = 0.2):
@@ -173,17 +189,21 @@ class PlotSink:
 
 
 class ReceiverApp:
-    def __init__(self, listen_ip: str, port: int, window_size: int, plot: bool):
+    def __init__(self, listen_ip: str, port: int, window_size: int, plot: bool,
+                 print_every: float):
         self.receiver = TCPServerReceiver(listen_ip, port)
         self.window = PPGWindowBuffer(window_size)
         self.plot_enabled = plot
-        self.printer = PrinterSink(every_seconds=0.2)
+        self.printer = PrinterSink(every_seconds=print_every)
         self.plotter = PlotSink(self.window) if plot else None
         self._stop = threading.Event()
+        self.rx_rate = RateMonitor(interval_sec=2.0)
+
 
     def _ingest_loop(self):
         while not self._stop.is_set():
             packets = self.receiver.poll(max_records=2000)
+            self.rx_rate.add(len(packets))
             for ts, red, ir, src_ip in packets:
                 self.window.append(ts, red, ir)
                 if not self.plot_enabled:
@@ -210,9 +230,12 @@ def main():
     p.add_argument("--port", type=int, default=9999, help="UDP port to listen on.")
     p.add_argument("--plot", action="store_true", help="Show live plot.")
     p.add_argument("--window", type=int, default=2000, help="Plot window size (samples).")
+    p.add_argument("--print-every", type=float, default=0.2,
+                   help="Seconds between printed samples (0.2 -> ~5 lines/sec).")
     args = p.parse_args()
 
-    ReceiverApp(args.listen_ip, args.port, args.window, args.plot).run()
+    ReceiverApp(args.listen_ip, args.port, args.window, args.plot,
+                args.print_every).run()
 
 
 if __name__ == "__main__":
