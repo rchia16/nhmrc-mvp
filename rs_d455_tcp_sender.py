@@ -107,17 +107,26 @@ class RealSenseD455TCPSender:
         self,
         host: str,
         port: int,
-        width: int = 640,
-        height: int = 480,
-        fps: int = 30,
+        color_width: int = 640,
+        color_height: int = 480,
+        depth_width: int = 640,
+        depth_height: int = 480,
+        fps: int = 15,
         jpeg_quality: int = 80,
+        color_format=rs.format.bgr8,
+        ppg_latest_fn=None,
     ):
         self.host = host      # desktop PC IP
         self.port = port
-        self.width = width
-        self.height = height
+        self.color_width = color_width
+        self.color_height = color_height
+        self.depth_width = depth_width
+        self.depth_height = depth_height
         self.fps = fps
         self.jpeg_quality = jpeg_quality
+        # Optional callable returning the latest PPG tuple (ts, red, ir) or None.
+        # If provided, we piggyback this into every RGB-D packet as "ppg_latest".
+        self.ppg_latest_fn = ppg_latest_fn
 
         self.sock = None
         self.running = False
@@ -127,10 +136,20 @@ class RealSenseD455TCPSender:
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         
-        self.config.enable_stream(rs.stream.color, self.width, self.height,
-                                  rs.format.bgr8, self.fps)
-        self.config.enable_stream(rs.stream.depth, self.width, self.height,
-                                  rs.format.z16, self.fps)
+        self.config.enable_stream(
+            rs.stream.color,
+            color_width,
+            color_height,
+            color_format,
+            fps
+        )
+        self.config.enable_stream(
+            rs.stream.depth,
+            depth_width,
+            depth_height,
+            rs.format.z16,
+            fps
+        )
 
         self.profile = self.pipeline.start(self.config)
         print("RealSense D455 started (color + depth).")
@@ -221,7 +240,7 @@ class RealSenseD455TCPSender:
                 depth_image = np.asanyarray(depth_frame.get_data())  # uint16 (z16)
                 # Depth compression: 16-bit PNG (lossless)
                 # 0..9 (higher = smaller/slower)
-                png_params = [int(cv2.IMWRITE_PNG_COMPRESSION), 3]   
+                png_params = [int(cv2.IMWRITE_PNG_COMPRESSION), 0]   
                 ok_d, enc_d = cv2.imencode(".png", depth_image, png_params)
                 if not ok_d:
                     print("Failed to encode depth as PNG.")
@@ -242,12 +261,23 @@ class RealSenseD455TCPSender:
                     "jpeg": jpeg_bytes,
                     "depth_png": depth_png_bytes,
                     "depth_scale": self.depth_scale,
-                    "depth_wh": (int(self.width), int(self.height)),
+                    "depth_wh": (int(self.depth_width),
+                                 int(self.depth_height)),
+                    "color_wh": (int(self.color_width),
+                                 int(self.color_height)),
                     "imu": {
                         "accel": accel_data,
                         "gyro": gyro_data,
                     },
                 }
+
+                # Optionally piggyback latest PPG sample to guarantee at least 1 PPG sample
+                # delivered per RGB-D packet (even if the separate PPG TCP stream stalls).
+                if self.ppg_latest_fn is not None:
+                    try:
+                        packet["ppg_latest"] = self.ppg_latest_fn()
+                    except Exception:
+                        packet["ppg_latest"] = No
 
                 payload = pickle.dumps(packet, protocol=pickle.HIGHEST_PROTOCOL)
                 if self.sock is None:
@@ -300,9 +330,9 @@ def main():
     sender = RealSenseD455TCPSender(
         host=desktop_ip,
         port=port,
-        width=640,
-        height=480,
-        fps=30,
+        color_width=640, color_height=480,
+        depth_width=640, depth_height=480,
+        fps=15,
         jpeg_quality=80,
     )
 

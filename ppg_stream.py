@@ -60,6 +60,13 @@ class RingBuffer:
     def snapshot(self):
         with self._lock:
             return list(self._buf)
+    
+    def latest(self):
+        """ Return the most recent (ts, red, ir) sample or None."""
+        with self._lock:
+            if not self._buf:
+                return None
+            return self._buf[-1]
 
 class SampleSpooler:
     PACK_FMT = "!dii"
@@ -71,11 +78,15 @@ class SampleSpooler:
         rotate_every_seconds: int = 3600,
         forward_sender=None,
         fsync_every: int = 0,
+        file_buffer_bytes: int = 1024 * 1024,
+        write_batch_bytes: int = 64 * 1024,
     ):
         self.log_dir = log_dir
         self.rotate_every = timedelta(seconds=rotate_every_seconds)
         self.forward_sender = forward_sender
         self.fsync_every = fsync_every
+        self.file_buffer_bytes = int(file_buffer_bytes)
+        self.write_batch_bytes = int(write_batch_bytes)
 
         self.q = queue.SimpleQueue()
         self._running = False
@@ -83,14 +94,35 @@ class SampleSpooler:
         self._fh = None
         self._count = 0
         self._next_rotate = None
+        self._wbuf = bytearray()
 
     def _open_new_file(self):
         os.makedirs(self.log_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         path = os.path.join(self.log_dir, f"ppg_{ts}.bin")
-        self._fh = open(path, "ab", buffering=0)
+        # Buffered writes are critical on SD (and under load)
+        # Unbuffered writes at ~200Hz can starve forward to TCP
+        self._fh = open(path, "ab", buffering=self.file_buffer_bytes)
         self._next_rotate = datetime.now() + self.rotate_every
         print(f"[LOG] New file: {path}")
+
+    def _flush_file_buffer(self, force:bool=False):
+        if not self._fh:
+            return
+        if not self._wbuf:
+            return
+        if (not force) and (len(self._wbuf) < self.write_batch_bytes):
+            return
+
+        self._fh.write(self._wbuf)
+        self._wbuf.clear()
+
+        if self.fsync_every and (self._count % self.fsync_every == 0):
+            try:
+                self._fh.flush()
+                os.fsync(self._fh.fileno())
+            except Exception:
+                pass
 
     def start(self):
         self._open_new_file()
@@ -104,6 +136,12 @@ class SampleSpooler:
         if self._thread:
             self._thread.join(timeout=2)
         if self._fh:
+            # best-effort flush
+            try:
+                self._flush_file_buffer(force=True)
+                self._fh.flush()
+            except Exception:
+                pass
             self._fh.close()
 
     def enqueue(self, sample):
@@ -116,15 +154,24 @@ class SampleSpooler:
                 continue
 
             if datetime.now() >= self._next_rotate:
+                # Flush before rotation
+                try:
+                    self._flush_file_buffer(force=True)
+                    self._fh.flush()
+                except Exception:
+                    pass
                 self._fh.close()
                 self._open_new_file()
 
             ts, red, ir = item
-            self._fh.write(struct.pack(self.PACK_FMT, ts, red, ir))
-            self._count += 1
-
+            # 1) Forward FIRST (so network delivery is not blocked by SD-card stalls)
             if self.forward_sender:
                 self.forward_sender.enqueue(ts, red, ir)
+
+            # 2) Then log (batched + buffered)
+            self._wbuf.extend(struct.pack(self.PACK_FMT, ts, red, ir))
+            self._count += 1
+            self._flush_file_buffer(force=False)
 
 
 
@@ -136,10 +183,17 @@ class TCPPPGSender:
     PACK_FMT = "!dii"
     PACK_SIZE = struct.calcsize(PACK_FMT)
 
-    def __init__(self, host: str, port: int, reconnect_sec: float = 2.0):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        reconnect_sec: float = 2.0,
+        max_batch_samples: int = 64,
+    ):
         self.host = host
         self.port = int(port)
         self.reconnect_sec = float(reconnect_sec)
+        self.max_batch_samples = int(max_batch_samples)
 
         self._q = queue.SimpleQueue()
         self._running = False
@@ -190,17 +244,30 @@ class TCPPPGSender:
                     print(f"[TCP] Connect failed: {e}. Retrying in {self.reconnect_sec}s")
                     time.sleep(self.reconnect_sec)
                     continue
-
+            # Batch multiple samples into one TCP write to reduce syscall
+            # overhead.
             item = self._q.get()
             if item is None:
                 continue
 
+            buf = bytearray()
             ts, red, ir = item
-            pkt = struct.pack(self.PACK_FMT, ts, red, ir)
+            buf.extend(struct.pack(self.PACK_FMT, ts, red, ir))
+
+            # Drain quickly without blocking to build a batch
+            for _ in range(self.max_batch_samples - 1):
+                try:
+                    nxt = self._q.get_nowait()
+                except Exception:
+                    break
+                if nxt is None:
+                    continue
+                ts, red, ir = nxt
+                buf.extend(struct.pack(self.PACK_FMT, ts, red, ir))
 
             try:
                 # sendall guarantees full write or raises
-                self._sock.sendall(pkt)
+                self._sock.sendall(buf)
             except Exception as e:
                 print(f"[TCP] Send failed: {e}. Reconnecting...")
                 self._close_sock()
