@@ -3,10 +3,37 @@ import argparse
 import socket
 import struct
 import pickle
+import threading
+import time
 from typing import Optional, Tuple
 
 import numpy as np
 import cv2
+
+class LatestItem:
+    """Single-slot buffer: newest item wins; counts overwrites as drops."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._item = None
+        self._updated = threading.Event()
+        self.dropped = 0
+
+    def put(self, item):
+        with self._lock:
+            if self._item is not None:
+                self.dropped += 1
+            self._item = item
+            self._updated.set()
+
+    def get_latest(self, block: bool = True, timeout: float = 0.5):
+        if block:
+            self._updated.wait(timeout=timeout)
+        with self._lock:
+            item = self._item
+            self._item = None
+            if self._item is None:
+                self._updated.clear()
+            return item
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -41,6 +68,21 @@ def decode_depth_png(depth_png: bytes) -> Optional[np.ndarray]:
     if depth.dtype != np.uint16:
         depth = depth.astype(np.uint16, copy=False)
     return depth
+
+def overlay_hud(frame: np.ndarray, txt_lines) -> None:
+    y = 60
+    for line in txt_lines:
+        cv2.putText(
+            frame, line, (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+            (255, 255, 255), 2, cv2.LINE_AA
+        )
+        cv2.putText(
+            frame, line, (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+            (0, 0, 0), 1, cv2.LINE_AA
+        )
+        y += 22
 
 
 def depth_to_colormap(depth_u16: np.ndarray, depth_scale: float) -> np.ndarray:
@@ -107,57 +149,123 @@ def overlay_depth_probe(
     )
 
 
-def handle_client(conn: socket.socket, show_depth: bool, show_rgb: bool) -> None:
+def handle_client(
+    conn: socket.socket,
+    show_depth: bool,
+    show_rgb: bool,
+    probe_depth: bool
+) -> None:
     print("Client connected.")
-    try:
-        while True:
-            header = recv_exact(conn, 4)
-            (length,) = struct.unpack("!I", header)
 
-            payload = recv_exact(conn, length)
+    # Reduce kernel buffering (helps prevent “stale frames”)
+    try:
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 16)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 16)
+    except Exception:
+        pass
+
+    cv2.setUseOptimized(True)
+
+    latest_payload = LatestItem()
+    stop = threading.Event()
+
+    def rx_loop():
+        try:
+            while not stop.is_set():
+                header = recv_exact(conn, 4)
+                (length,) = struct.unpack("!I", header)
+                payload = recv_exact(conn, length)
+                # Store raw payload bytes; decode happens on display thread.
+                latest_payload.put(payload)
+        except EOFError:
+            pass
+        except Exception as e:
+            print(f"[RX] error: {e}")
+        finally:
+            stop.set()
+
+    t_rx = threading.Thread(target=rx_loop, daemon=True)
+    t_rx.start()
+
+    # Stats
+    t0 = time.perf_counter()
+    n_show = 0
+    last_fps_t = t0
+    fps = 0.0
+    latency_ms = None
+
+    try:
+        while not stop.is_set():
+            payload = latest_payload.get_latest(block=True, timeout=0.5)
+            if payload is None:
+                continue
+
+            # Decode packet (pickle) on display thread
             packet = pickle.loads(payload)
 
             jpeg_bytes = packet.get("jpeg")
             imu = packet.get("imu", {})
-
-            depth_png = packet.get("depth_png")  # PNG-encoded uint16
+            depth_png = packet.get("depth_png")
             depth_scale = float(packet.get("depth_scale", 0.001))
 
+            # One-way “network+encode+decode” latency estimate (requires clock sync!)
+            ts_sender = packet.get("t", None)
+            if isinstance(ts_sender, (int, float)):
+                latency_ms = (time.time() - float(ts_sender)) * 1000.0
+
             frame = decode_jpeg(jpeg_bytes)
-
-            depth_u16 = None
-            if depth_png is not None:
-                depth_u16 = decode_depth_png(depth_png)
-
             if frame is None:
-                print("Received frame could not be decoded.")
                 continue
+
+            # Only decode depth if we actually need it
+            depth_u16 = None
+            need_depth = (show_depth or probe_depth)
+            if need_depth and depth_png:
+                depth_u16 = decode_depth_png(depth_png)
 
             overlay_imu_text(frame, imu)
 
-            if depth_u16 is not None:
+            if probe_depth and (depth_u16 is not None):
                 probe_xy = (frame.shape[1] // 2, frame.shape[0] // 2)
                 overlay_depth_probe(frame, depth_u16, depth_scale, probe_xy)
+
+            # Update FPS
+            n_show += 1
+            now = time.perf_counter()
+            dt = now - last_fps_t
+            if dt >= 0.5:
+                fps = n_show / (now - t0)
+                last_fps_t = now
+
+            hud = [
+                f"FPS (avg): {fps:.1f}",
+                f"Dropped (latest-wins): {latest_payload.dropped}",
+            ]
+            if latency_ms is not None:
+                hud.append(f"One-way latency*: {latency_ms:.1f} ms")
+            hud.append("*Requires Pi/PC clock sync (NTP/Chrony)")
+            overlay_hud(frame, hud)
 
             if show_rgb:
                 cv2.imshow("RealSense D455 RGB", frame)
 
-            if show_depth and depth_u16 is not None:
+            if show_depth and (depth_u16 is not None):
                 depth_vis = depth_to_colormap(depth_u16, depth_scale)
                 cv2.imshow("RealSense D455 Depth (colormap)", depth_vis)
 
-            if show_rgb or (show_depth and depth_u16 is not None):
-                key = cv2.waitKey(1) & 0xFF
-                if key == 27:
-                    print("ESC pressed, closing viewer.")
-                    break
+            # Keep waitKey minimal; ESC exits
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27:
+                print("ESC pressed, closing viewer.")
+                break
 
-    except EOFError:
-        print("Client disconnected.")
-    except Exception as e:
-        print(f"Receiver error: {e}")
     finally:
-        conn.close()
+        stop.set()
+        try:
+            conn.close()
+        except Exception:
+            pass
         cv2.destroyAllWindows()
 
 
@@ -167,6 +275,9 @@ def main():
     ap.add_argument("--port", type=int, default=50000, help="TCP port to listen on (default: 50000)")
     ap.add_argument("--no-rgb", action="store_true", help="Do not display the RGB window")
     ap.add_argument("--show-depth", action="store_true", help="If depth is present, display a depth colormap window")
+    ap.add_argument("--probe-depth", action="store_true",
+                    help="Overlay depth probe text (forces depth decode even "\
+                    "if --show-depth is off).")
     args = ap.parse_args()
 
     host = args.listen_ip
@@ -184,7 +295,12 @@ def main():
         while True:
             conn, addr = server_sock.accept()
             print(f"Incoming connection from {addr}")
-            handle_client(conn, show_depth=show_depth, show_rgb=show_rgb)
+            handle_client(
+                conn,
+                show_depth=show_depth,
+                show_rgb=show_rgb,
+                probe_depth=bool(args.probe_depth)
+            )
     except KeyboardInterrupt:
         print("KeyboardInterrupt: shutting down server.")
     finally:
