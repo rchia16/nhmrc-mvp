@@ -1,0 +1,57 @@
+network:
+  pc_ip: "192.168.50.1"
+  pc_listen_ip: "0.0.0.0"
+  pi_ip: "192.168.50.2"
+  pi_listen_ip: "0.0.0.0"
+
+ports:
+  rs_udp: 50010
+  ppg_tcp: 9999
+  audio_udp: 40100
+
+realsense:
+  color_w: 640
+  color_h: 480
+  depth_w: 480
+  depth_h: 270
+  fps: 15
+  mtu_payload: 1400
+  no_depth: false
+  rs_timeout_ms: 200
+  max_inflight: 8
+
+ppg:
+  log_dir: "logs/"
+  rotate_seconds: 3600
+  fsync_every: 0
+  rate_print: true
+  force_poll: false
+  no_data_timeout: 5.0
+  poll_sleep_ms: 5.0
+  pc_poll_hz: 500.0
+
+audio:
+  bt_mac: "AA:BB:CC:DD:EE:FF"
+  pair: true
+  trust: true
+  bt_reconnect_every: 5.0
+  recv_reassembly_timeout_s: 1.0
+  keep_audio_files: false
+  debug_udp: false
+  send_chunk_bytes: 1200
+  send_inter_packet_sleep_s: 0.0
+
+yolo:
+  model: "yolov8n.pt"
+  conf: 0.30
+  stable_seconds: 0.20
+  forget_seconds: 1.00
+  cooldown_seconds: 0.60
+  yolo_hz: 10.0
+
+sonification:
+  default_sound: "./sound-lib/ui_sci-fi-sound-36061.mp3"
+  sound_map:
+    person: "./sound-lib/mixkit-retro-game-notification-212.wav"
+    couch: "./sound-lib/mixkit-arcade-retro-game-over-213.wav"
+
