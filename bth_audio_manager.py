@@ -367,7 +367,7 @@ class UDPAudioBluetoothReceiverApp:
         self._worker = threading.Thread(target=self._playback_loop, daemon=True)
         self._worker.start()
 
-        threading.Thread(target=self._bt_reconnect_loop, daemon=True).start()
+        # threading.Thread(target=self._bt_reconnect_loop, daemon=True).start()
 
     def stop(self):
         self._running = False

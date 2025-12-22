@@ -31,13 +31,13 @@ ppg:
   pc_poll_hz: 500.0
 
 audio:
-  bt_mac: "AA:BB:CC:DD:EE:FF"
+  bt_mac: "28:FA:19:0F:E9:CF"
   pair: true
   trust: true
   bt_reconnect_every: 5.0
   recv_reassembly_timeout_s: 1.0
   keep_audio_files: false
-  debug_udp: false
+  debug_udp: true
   send_chunk_bytes: 1200
   send_inter_packet_sleep_s: 0.0
 
