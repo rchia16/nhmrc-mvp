@@ -530,7 +530,8 @@ def main():
 
     # recv (Pi)
     ap_r = sub.add_parser("recv", help="Raspberry Pi: connect BT speaker, receive UDP audio files, play them")
-    ap_r.add_argument("--bt-mac", required=True, help="Bluetooth speaker MAC address (AA:BB:CC:DD:EE:FF)")
+    ap_r.add_argument("--bt-mac", required=True, help="Bluetooth speaker MAC "\
+                      "address (AA:BB:CC:DD:EE:FF)", default="28:FA:19:0F:E9:CF")
     ap_r.add_argument("--udp-ip", default="0.0.0.0", help="UDP bind IP (default: 0.0.0.0)")
     ap_r.add_argument("--udp-port", type=int, default=40100, help="UDP port to receive audio files")
     ap_r.add_argument("--pair", action="store_true", help="Try to pair with the device (first-time setup)")
