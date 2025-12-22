@@ -5,7 +5,7 @@ import time
 import signal
 import sys
 
-from shared_config import load_config, deep_get
+from config import load_config, deep_get
 
 
 def _run_rs_sender(cfg, stop_evt: threading.Event):
