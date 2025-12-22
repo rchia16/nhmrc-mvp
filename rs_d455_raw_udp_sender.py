@@ -349,11 +349,11 @@ def main():
     ap.add_argument("--pc-ip", required=True, help="PC receiver IP")
     ap.add_argument("--pc-port", type=int, default=50010, help="PC receiver UDP port")
 
-    ap.add_argument("--color-w", type=int, default=640)
-    ap.add_argument("--color-h", type=int, default=480)
-    ap.add_argument("--depth-w", type=int, default=640)
-    ap.add_argument("--depth-h", type=int, default=480)
-    ap.add_argument("--fps", type=int, default=15)
+    ap.add_argument("--color-w", type=int, default=640) # 640
+    ap.add_argument("--color-h", type=int, default=480) # 480
+    ap.add_argument("--depth-w", type=int, default=480) # 640
+    ap.add_argument("--depth-h", type=int, default=270) # 480
+    ap.add_argument("--fps", type=int, default=15) # 30
 
     ap.add_argument("--no-depth", action="store_true", help="Send RGB only (lowest bandwidth)")
     ap.add_argument("--mtu-payload", type=int, default=1400, help="Max UDP datagram size (bytes)")
