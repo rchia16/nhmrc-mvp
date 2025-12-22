@@ -129,9 +129,12 @@ class UDPFileReceiver:
         listen_ip: str,
         port: int,
         out_queue: "queue.Queue[Tuple[str, bytes]]",
-        timeout_s: float = 1.0,
-        max_inflight: int = 8,
-        rcvbuf_bytes: int = 1 << 22,
+        # Large SOFA WAVs often need longer than 1s to fully arrive on a busy link.
+        timeout_s: float = 3.0,
+        # Avoid holding many incomplete files; "latest wins" playback prefers fewer inflight.
+        max_inflight: int = 2,
+        # Bigger socket buffer reduces drops during bursts.
+        rcvbuf_bytes: int = 8 << 20,
         debug: bool = False,
     ):
         self.listen_ip = listen_ip
@@ -335,7 +338,9 @@ class UDPAudioBluetoothReceiverApp:
         pair: bool,
         trust: bool,
         reconnect_every_s: float = 5.0,
-        reassembly_timeout_s: float = 1.0,
+        reassembly_timeout_s: float = 3.0,
+        max_inflight: int = 2,
+        rcvbuf_bytes: int = 8 << 20,
         keep_files: bool = False,
         debug_udp: bool = False,
     ):
@@ -346,6 +351,8 @@ class UDPAudioBluetoothReceiverApp:
             port=udp_port,
             out_queue=self.q,
             timeout_s=reassembly_timeout_s,
+            max_inflight=max_inflight,
+            rcvbuf_bytes=rcvbuf_bytes,
             debug=debug_udp,
         )
         self.player = AudioPlayer(keep_files=keep_files)
@@ -426,16 +433,27 @@ class UDPAudioFileSender:
         ttl: int = 64,
         dscp: int = 0,   # 0..63 (optional QoS)
         bind_ip: str = "",
+        sndbuf_bytes: int = 8 << 20,
+        min_inter_file_gap_s: float = 0.0,
     ):
         self.target = (target_ip, int(target_port))
         self.chunk_payload_bytes = int(chunk_payload_bytes)
         if self.chunk_payload_bytes <= 0:
             raise ValueError("chunk_payload_bytes must be > 0")
         self.inter_packet_sleep_s = float(inter_packet_sleep_s)
+        self.min_inter_file_gap_s = float(min_inter_file_gap_s)
+        self._last_file_sent_t = 0.0
+        self._send_lock = threading.Lock()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         if bind_ip:
             self.sock.bind((bind_ip, 0))
+
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(sndbuf_bytes))
+        except Exception:
+            pass
+
         try:
             self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, int(ttl))
         except OSError:
@@ -459,37 +477,72 @@ class UDPAudioFileSender:
             chunks.append(all_bytes[i : i + chunk_payload_bytes])
         return chunks
 
-    def send_file(self, path: str, file_id: Optional[int] = None, repeat_chunk0: int = 2):
-        with open(path, "rb") as f:
-            b = f.read()
+    def send_bytes(
+        self,
+        filename: str,
+        file_bytes: bytes,
+        file_id: Optional[int] = None,
+        repeat_chunk0: int = 4,
+        auto_pace_big_files: bool = True,
+    ):
+        """
+        Send in-memory bytes as a chunked UDP "file".
+        - repeat_chunk0: sends the first chunk multiple times (contains filename prefix)
+        - auto_pace_big_files: if payload is large, enable a small default inter-packet sleep
+          to reduce receiver drops under load.
+        """
+        b = file_bytes
+ 
 
         if file_id is None:
             file_id = random.randint(1, 0xFFFFFFFF)
 
-        chunks = self._build_chunks(os.path.basename(path), b, self.chunk_payload_bytes)
+        chunks = self._build_chunks(os.path.basename(filename), b, self.chunk_payload_bytes)
         cnt = len(chunks)
         if cnt == 0:
             raise ValueError("File is empty (no chunks to send).")
         if cnt > 0xFFFF:
             raise ValueError(f"Too many chunks ({cnt}) for u16 fields. Increase --chunk-bytes.")
 
-        print(f"[SEND] {path} -> {self.target[0]}:{self.target[1]}")
+        # If we are sending large SOFA WAVs (hundreds of KB), a tiny pacing
+        # greatly reduces drops.
+        inter_sleep = self.inter_packet_sleep_s
+        if auto_pace_big_files and inter_sleep <= 0.0 and len(b) >= 64 * 1024:
+            inter_sleep = 0.0008  # ~0.8ms; tune 0.0003..0.002 if needed
+
+        print(f"[SEND] {filename} -> {self.target[0]}:{self.target[1]}")
         print(f"[SEND] bytes={len(b)}  chunk_payload={self.chunk_payload_bytes}  chunks={cnt}  file_id={file_id}")
 
         # Send chunk0 multiple times to reduce chance of losing filename prefix.
         idx_order = [0] * max(1, int(repeat_chunk0)) + list(range(1, cnt))
 
-        t0 = time.time()
-        for idx in idx_order:
-            payload = chunks[idx]
-            hdr = struct.pack(HDR_FMT, MAGIC, int(file_id), int(idx), int(cnt), int(len(payload)), 0)
-            self.sock.sendto(hdr + payload, self.target)
-            if self.inter_packet_sleep_s > 0:
-                time.sleep(self.inter_packet_sleep_s)
+        with self._send_lock:
+            # Optional gap between whole files (prevents piling up many
+            # inflight file_ids on receiver)
+            if self.min_inter_file_gap_s > 0:
+                dt_gap = time.time() - self._last_file_sent_t
+                if dt_gap < self.min_inter_file_gap_s:
+                    time.sleep(self.min_inter_file_gap_s - dt_gap)
+
+            t0 = time.time()
+            for idx in idx_order:
+                payload = chunks[idx]
+                hdr = struct.pack(HDR_FMT, MAGIC, int(file_id), int(idx),
+                                  int(cnt), int(len(payload)), 0)
+                self.sock.sendto(hdr + payload, self.target)
+                if inter_sleep > 0:
+                    time.sleep(inter_sleep)
+            self._last_file_sent_t = time.time()
 
         dt = time.time() - t0
         pps = len(idx_order) / dt if dt > 0 else float("inf")
         print(f"[SEND] done in {dt:.3f}s  packets={len(idx_order)}  ~{pps:.1f} pkt/s")
+
+    def send_file(self, path: str, file_id: Optional[int] = None, repeat_chunk0: int = 4):
+        with open(path, "rb") as f:
+            b = f.read()
+        self.send_bytes(os.path.basename(path), b, file_id=file_id,
+                        repeat_chunk0=repeat_chunk0)
 
 
 # ---------------------- CLI ----------------------
@@ -503,6 +556,8 @@ def _cmd_recv(args: argparse.Namespace) -> int:
         trust=not args.no_trust,
         reconnect_every_s=args.reconnect_every,
         reassembly_timeout_s=args.timeout,
+        max_inflight=args.max_inflight,
+        rcvbuf_bytes=args.rcvbuf,
         keep_files=args.keep_files,
         debug_udp=args.debug_udp,
     )
@@ -519,6 +574,8 @@ def _cmd_send(args: argparse.Namespace) -> int:
         ttl=args.ttl,
         dscp=args.dscp,
         bind_ip=args.bind_ip,
+        sndbuf_bytes=args.sndbuf,
+        min_inter_file_gap_s=args.file_gap,
     )
     sender.send_file(args.file, repeat_chunk0=args.repeat_chunk0)
     return 0
@@ -537,7 +594,13 @@ def main():
     ap_r.add_argument("--pair", action="store_true", help="Try to pair with the device (first-time setup)")
     ap_r.add_argument("--no-trust", action="store_true", help="Do not trust the device")
     ap_r.add_argument("--reconnect-every", type=float, default=5.0, help="Seconds between BT reconnect attempts")
-    ap_r.add_argument("--timeout", type=float, default=1.0, help="Seconds to wait for missing UDP chunks before dropping a file")
+    ap_r.add_argument("--timeout", type=float, default=3.0, help="""Seconds
+                      to wait for missing UDP chunks before dropping a
+                      file""")
+    ap_r.add_argument("--max-inflight", type=int, default=2, help="""Max
+                      concurrent incomplete files to track (default: 2)""")
+    ap_r.add_argument("--rcvbuf", type=int, default=8 << 20,
+                       help="UDP receive socket buffer bytes (default: 8MiB)")
     ap_r.add_argument("--keep-files", action="store_true", help="Keep received files on disk (debug)")
     ap_r.add_argument("--debug-udp", action="store_true", help="Extra UDP debug prints")
     ap_r.set_defaults(func=_cmd_recv)
@@ -549,10 +612,15 @@ def main():
     ap_s.add_argument("--file", required=True, help="Path to audio file (wav/mp3/ogg etc.)")
     ap_s.add_argument("--chunk-bytes", type=int, default=1200, help="Payload bytes per UDP packet (safe for MTU1500)")
     ap_s.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between packets (try 0.0005 if drops)")
-    ap_s.add_argument("--repeat-chunk0", type=int, default=2, help="How many times to send chunk0 (filename prefix) (default: 2)")
+    ap_s.add_argument("--repeat-chunk0", type=int, default=4, help="""How many
+                      times to send chunk0 (filename prefix) (default: 4)""")
     ap_s.add_argument("--ttl", type=int, default=64)
     ap_s.add_argument("--dscp", type=int, default=0, help="DSCP 0..63 (QoS), optional")
     ap_s.add_argument("--bind-ip", default="", help="Optional local bind IP")
+    ap_s.add_argument("--sndbuf", type=int, default=8 << 20, help="""UDP send
+                      socket buffer bytes (default: 8MiB)""")
+    ap_s.add_argument("--file-gap", type=float, default=0.0, help="""Minimum
+                      seconds between whole files (rate limit). Try 0.15""")
     ap_s.set_defaults(func=_cmd_send)
 
     args = ap.parse_args()
