@@ -4,9 +4,13 @@ import threading
 import time
 import signal
 import sys
+import numpy as np
 
 from config import load_config, deep_get
 from udp_pcm_stream import PCMStreamPlayerApp, PCMStreamParams
+from yolo_sofa import DepthAwareSpatialSound, SpatialSoundHeadphoneYOLO
+from pythonosc import dispatcher, osc_server
+
 
 
 def _run_rs_sender(cfg, stop_evt: threading.Event):
@@ -57,24 +61,49 @@ def _run_ppg_stream(cfg, stop_evt: threading.Event):
         stop_evt.set()
 
 
-# def _run_audio_bt_receiver_wait(cfg, stop_evt: threading.Event):
-#     from bth_audio_manager import UDPAudioBluetoothReceiverApp
+def _run_audio_bt_receiver_wait(cfg, stop_evt: threading.Event):
+    from bth_audio_manager import UDPAudioBluetoothReceiverApp
 
-#     app = UDPAudioBluetoothReceiverApp(
-#         bt_mac=deep_get(cfg, "audio.bt_mac"),
-#         udp_listen_ip=deep_get(cfg, "network.pi_listen_ip", "0.0.0.0"),
-#         udp_port=int(deep_get(cfg, "ports.audio_udp")),
-#         pair=bool(deep_get(cfg, "audio.pair")),
-#         trust=bool(deep_get(cfg, "audio.trust")),
-#         reconnect_every_s=float(deep_get(cfg, "audio.bt_reconnect_every")),
-#         reassembly_timeout_s=float(deep_get(cfg, "audio.recv_reassembly_timeout_s")),
-#         keep_files=bool(deep_get(cfg, "audio.keep_audio_files")),
-#         debug_udp=bool(deep_get(cfg, "audio.debug_udp")),
-#     )
-#     try:
-#         app.run_forever()
-#     finally:
-#         stop_evt.set()
+    app = UDPAudioBluetoothReceiverApp(
+        bt_mac=deep_get(cfg, "audio.bt_mac"),
+        udp_listen_ip=deep_get(cfg, "network.pi_listen_ip", "0.0.0.0"),
+        udp_port=int(deep_get(cfg, "ports.audio_udp")),
+        pair=bool(deep_get(cfg, "audio.pair")),
+        trust=bool(deep_get(cfg, "audio.trust")),
+        reconnect_every_s=float(deep_get(cfg, "audio.bt_reconnect_every")),
+        reassembly_timeout_s=float(deep_get(cfg, "audio.recv_reassembly_timeout_s")),
+        keep_files=bool(deep_get(cfg, "audio.keep_audio_files")),
+        debug_udp=bool(deep_get(cfg, "audio.debug_udp")),
+    )
+    try:
+        app.run_forever()
+    finally:
+        stop_evt.set()
+
+def _run_depth_ordered_spatialiser(cfg, stop_evt: threading.Event):
+    """
+    Listen for classified object coordinates (x, y, depth) and spatialise
+    their associated sounds using the SOFA BRIR. Objects within a scene are
+    played from nearest to farthest.
+    """
+
+    sofa_path = deep_get(cfg, "sonification.sofa", "./sofa-lib/BRIR_HATS_3degree_for_glasses.sofa")
+    image_width = float(deep_get(cfg, "realsense.color_w", 640))
+    osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
+
+    app = DepthAwareSpatialSound(sofa_file_path=sofa_path, image_width=image_width, osc_port=osc_port)
+
+    thread = threading.Thread(target=app.start, daemon=True)
+    thread.start()
+
+    try:
+        while not stop_evt.is_set():
+            time.sleep(0.2)
+    finally:
+        try:
+            app.OSCserver.server_close()
+        except Exception:
+            pass
 
 def _run_audio_bt_receiver(cfg, stop_evt: threading.Event):
     # Streaming mode (long-term)
@@ -92,7 +121,7 @@ def _run_audio_bt_receiver(cfg, stop_evt: threading.Event):
             listen_port=int(deep_get(cfg, "audio.stream.port", 50030)),
             params=p,
             alsa_device=deep_get(cfg, "audio.stream.alsa_device", None),
-            debug=bool(deep_get(cfg, "audio.debug_udp", False)),
+            debug=bool(deep_get(cfg, "audio.debug_udp", True)),
         )
         app.start()
     else:
@@ -104,7 +133,7 @@ def _run_audio_bt_receiver(cfg, stop_evt: threading.Event):
             bt_mac=str(deep_get(cfg, "audio.bt_mac", "")),
             tmp_dir=str(deep_get(cfg, "audio.tmp_dir", "/tmp/udp_audio")),
             keep_files=bool(deep_get(cfg, "audio.keep_audio_files", False)),
-            debug=bool(deep_get(cfg, "audio.debug_udp", False)),
+            debug=bool(deep_get(cfg, "audio.debug_udp", True)),
         )
         app.start()
 
@@ -139,6 +168,7 @@ def main():
         threading.Thread(target=_run_rs_sender, args=(cfg, stop_evt), daemon=True),
         threading.Thread(target=_run_ppg_stream, args=(cfg, stop_evt), daemon=True),
         threading.Thread(target=_run_audio_bt_receiver, args=(cfg, stop_evt), daemon=True),
+        threading.Thread(target=_run_depth_ordered_spatialiser, args=(cfg, stop_evt), daemon=True),
     ]
 
     for t in threads:

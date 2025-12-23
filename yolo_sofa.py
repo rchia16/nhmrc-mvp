@@ -538,6 +538,164 @@ class SpatialSoundHeadphoneYOLO:
 
         return signal_this.astype(np.float32, copy=False)
 
+class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
+    def __init__(self, osc_port: int = 6969, elevation_range_deg: float = 90.0, **kwargs):
+        self.osc_port = int(osc_port)
+        self.elevation_range_deg = float(elevation_range_deg)
+        super().__init__(**kwargs)
+
+        # Replace the OSC server with one that honours the configured port
+        # while reusing the inherited handler wiring.
+        try:
+            self.OSCserver.server_close()
+        except Exception:
+            pass
+        osc_dispatcher = dispatcher.Dispatcher()
+        osc_dispatcher.map("/yolo", self.yolo_handler)
+        self.OSCserver = osc_server.ThreadingOSCUDPServer(("0.0.0.0", self.osc_port), osc_dispatcher)
+
+    def yolo_handler(self, address, *args):
+        """Handle /yolo messages that include x, y, depth, and frame id."""
+
+        if not args:
+            return
+
+        raw_x = float(args[0])
+        extras = list(args[1:])
+
+        cid = extras[0] if extras else "default"
+        y_norm = float(extras[1]) if len(extras) >= 2 else 0.5
+        depth_m = extras[2] if len(extras) >= 3 else None
+        frame_id = extras[3] if len(extras) >= 4 else None
+
+        try:
+            depth_m = float(depth_m) if depth_m is not None else None
+        except (TypeError, ValueError):
+            depth_m = None
+
+        try:
+            frame_id = int(frame_id) if frame_id is not None else -1
+        except (TypeError, ValueError):
+            frame_id = -1
+
+        if raw_x > 1.0:
+            x_norm = max(0.0, min(1.0, raw_x / self.image_width))
+        else:
+            x_norm = max(0.0, min(1.0, raw_x))
+
+        azimuth_deg = -90.0 + 180.0 * x_norm
+        elevation_deg = (0.5 - max(0.0, min(1.0, y_norm))) * self.elevation_range_deg
+        radius = depth_m if depth_m is not None and depth_m > 0 else 1.0
+
+        sound_key = cid if cid in self.yolo_sounds else "default"
+        if sound_key not in self.yolo_sounds and self.yolo_sounds:
+            sound_key = next(iter(self.yolo_sounds))
+
+        scene = self.pending_scenes.get(frame_id)
+        if scene is None:
+            scene = {}
+            self.pending_scenes[frame_id] = scene
+            self.scene_order.append(frame_id)
+
+        scene[cid] = {
+            "spherical": np.array([azimuth_deg, elevation_deg, radius]),
+            "sound_key": sound_key,
+            "depth_m": radius,
+        }
+
+    def read_queue_manager(self):
+        while True:
+            if not self.playing:
+                if self.current_scene_id is None or self.current_scene_index >= len(self.current_scene_objects):
+                    if self.current_scene_id is not None and self.verbose:
+                        print(f"[SCENE] Finished scene {self.current_scene_id}")
+
+                    self.current_scene_id = None
+                    self.current_scene_objects = []
+                    self.current_scene_index = 0
+                    self.current_scene_start_t = None
+
+                    if not self.scene_order:
+                        time.sleep(0.02)
+                        continue
+
+                    latest_scene_id = max(self.scene_order)
+                    for sid in list(self.pending_scenes.keys()):
+                        if sid != latest_scene_id:
+                            if self.verbose:
+                                print(f"[SCENE] Flushing old scene {sid}")
+                            self.pending_scenes.pop(sid, None)
+                    self.scene_order = [latest_scene_id]
+
+                    next_scene_id = latest_scene_id
+                    scene_dict = self.pending_scenes.pop(next_scene_id, {})
+                    if not scene_dict:
+                        continue
+
+                    items = sorted(scene_dict.items(), key=lambda kv: kv[1].get("depth_m", float("inf")))
+
+                    self.current_scene_id = next_scene_id
+                    self.current_scene_objects = items
+                    self.current_scene_index = 0
+                    self.current_scene_start_t = time.time()
+
+                    if self.verbose:
+                        print(f"[SCENE] Starting scene {self.current_scene_id} with "
+                              f"{len(self.current_scene_objects)} objects (near->far)")
+
+                if self.current_scene_id is not None and self.current_scene_index < len(self.current_scene_objects):
+                    cid, obj = self.current_scene_objects[self.current_scene_index]
+                    can_play = True
+                    if self.min_interval_between_plays > 0 and cid in self.last_play_time:
+                        dt = time.time() - self.last_play_time[cid]
+                        if dt < self.min_interval_between_plays:
+                            can_play = False
+                            time.sleep(0.02)
+
+                    if can_play:
+                        self.message = {
+                            "yolo_spherical": obj.get("spherical", np.array([0, 0, 1])),
+                            "caller": "scene playback",
+                        }
+
+                        sound_key = obj.get("sound_key", "default")
+                        audio = None
+                        is_mono = True
+                        if sound_key in self.yolo_sounds:
+                            audio, fs = self.yolo_sounds[sound_key]
+                            is_mono = (audio.ndim == 1)
+                        if audio is None:
+                            if self.verbose:
+                                print(f"[SCENE] Missing audio for key {sound_key}")
+                            self.current_scene_index += 1
+                            continue
+
+                        self.playing = True
+                        if self.verbose:
+                            print(f"[SCENE] Playing scene {self.current_scene_id}, object index {self.current_scene_index}, "
+                                  f"cid={cid}, depth={obj.get('depth_m', 'n/a')}")
+
+                        audio_to_play = self.prepare_sound_yolo(self.yolo_counter, audio, is_mono=is_mono)
+                        self.yolo_counter += 1
+
+                        if audio_to_play is not None:
+                            self.enqueue_audio(audio_to_play)
+                            self.enqueue_gap()
+                            self.playing = False
+                            self.last_play_time[cid] = time.time()
+                        else:
+                            if self.verbose:
+                                print(f"[SCENE] prepare_sound_yolo returned None for cid={cid}")
+
+                        self.current_scene_index += 1
+                    else:
+                        time.sleep(0.02)
+                else:
+                    time.sleep(0.02)
+            else:
+                time.sleep(0.01)
+
+
 
 if __name__ == "__main__":
     MySS = SpatialSoundHeadphoneYOLO(verbose=True)
