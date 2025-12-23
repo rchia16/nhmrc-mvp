@@ -108,14 +108,14 @@ def _run_audio_bt_receiver(cfg, stop_evt: threading.Event):
         )
         app.start()
 
-      try:
-          while not stop_evt.is_set():
-              time.sleep(0.2)
-      finally:
-          try:
-              app.stop()
-          except Exception:
-              pass
+    try:
+        while not stop_evt.is_set():
+            time.sleep(0.2)
+    finally:
+        try:
+            app.stop()
+        except Exception:
+            pass
 
 
 def main():
