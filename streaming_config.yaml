@@ -36,7 +36,7 @@ audio:
   trust: true
   bt_reconnect_every: 5.0
   recv_reassembly_timeout_s: 1.0
-  keep_audio_files: true
+  keep_audio_files: false
   debug_udp: true
   send_chunk_bytes: 1200
   send_inter_packet_sleep_s: 0.01
