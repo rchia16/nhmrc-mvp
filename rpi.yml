@@ -9,6 +9,7 @@ dependencies:
   - pandas
   - opencv
   - smbus2
+  - pyyaml
   - pip
   - pip:
     - rpi-lgpio

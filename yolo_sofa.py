@@ -20,7 +20,7 @@ arcade_sound_file = join(sound_lib, 'mixkit-arcade-mechanical-bling-210.wav')
 retro_sound_file = join(sound_lib, 'mixkit-retro-game-notification-212.wav')
 unlock_sound_file = join(sound_lib, 'mixkit-unlock-game-notification-253.wav')
 shortz_sound_file = join(sound_lib, 'Shortzz.mp3')
-scifi_sound_file = join(sound_lib, 'ui_sci-fi-sound-36061.mp3')  # default
+scifi_sound_file = join(sound_lib, 'ui_sci-fi-sound-36061.wav')  # default
 
 
 class SpatialSoundHeadphoneYOLO:

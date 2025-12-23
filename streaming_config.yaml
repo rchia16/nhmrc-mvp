@@ -50,8 +50,15 @@ yolo:
   yolo_hz: 10.0
 
 sonification:
-  default_sound: "./sound-lib/ui_sci-fi-sound-36061.mp3"
+  default_sound: "./sound-lib/ui_sci-fi-sound-36061.wav"
+  sofa: "./sofa-lib/BRIR_HATS_3degree_for_glasses.sofa"
+  out_sr: 16000
+  clip_s: 0.35
+  fade_ms: 8.0
+  max_peak: 0.95
   sound_map:
     person: "./sound-lib/mixkit-retro-game-notification-212.wav"
     couch: "./sound-lib/mixkit-arcade-retro-game-over-213.wav"
-
+    chair: "./sound-lib/mixkit-arcade-retro-game-over-213.wav"
+    door: "./sound-lib/mixkit-arcade-retro-game-over-213.wav"
+    object: "./sound-lib/Shortzz.mp3"

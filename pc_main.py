@@ -149,24 +149,70 @@ class SofaSpatialiser:
     Wrapper around SpatialSoundHeadphoneYOLO for offline BRIR convolution.
     """
 
-    def __init__(self, sofa_path: str, image_width: float, verbose: bool = False):
+    def __init__(
+        self,
+        sofa_path: str,
+        image_width: float,
+        verbose: bool = False,
+        out_sr: int = 16000,
+        clip_s: float = 0.35,
+        fade_ms: float = 8.0,
+        max_peak: float = 0.95,
+    ):
         self.engine = SpatialSoundHeadphoneYOLO(
             sofa_file_path=sofa_path,
             image_width=image_width,
             verbose=verbose,
         )
-        self.fs = int(self.engine.BRIR_samplerate)
+        # BRIR sample rate (SOFA dataset / engine internal)
+        self.fs_brir = int(self.engine.BRIR_samplerate)
+
+        # Output constraints to reduce UDP payload:
+        # - short clips
+        # - resample to 16kHz
+        # - 16-bit PCM WAV
+        self.out_sr = int(out_sr)
+        self.clip_s = float(clip_s)
+        self.fade_ms = float(fade_ms)
+        self.max_peak = float(max_peak)
 
     @staticmethod
     def _ensure_mono(x: np.ndarray) -> np.ndarray:
         return x if x.ndim == 1 else x.mean(axis=1)
 
+    @staticmethod
+    def _apply_fade(x: np.ndarray, sr: int, fade_ms: float) -> np.ndarray:
+        """Short fade-in/out to avoid clicks when clipping."""
+        n = int(sr * (fade_ms / 1000.0))
+        if n <= 1 or x.size <= 2 * n:
+            return x
+        w = np.linspace(0.0, 1.0, n, dtype=np.float32)
+        x = x.copy()
+        x[:n] *= w
+        x[-n:] *= w[::-1]
+        return x
+
+    def _trim_clip(self, audio: np.ndarray, sr: int) -> np.ndarray:
+        """Keep only the first clip_s seconds (or entire signal if shorter)."""
+        if self.clip_s <= 0:
+            return audio
+        n = int(sr * self.clip_s)
+        if n <= 0:
+            return audio
+        return audio[:n]
+
     def spatialise_file(self, mono_path: str, az_deg: float, r: float) -> bytes:
         audio, fs_src = sf.read(mono_path, dtype="float32", always_2d=False)
         audio = self._ensure_mono(audio)
 
-        if fs_src != self.fs:
-            audio = signal.resample_poly(audio, self.fs, fs_src)
+        # 1) Trim early to reduce convolution cost
+        audio = self._trim_clip(audio, fs_src)
+
+        # 2) Resample source to BRIR sample rate for convolution
+        if fs_src != self.fs_brir:
+            audio = signal.resample_poly(audio, self.fs_brir,
+                                         fs_src).astype(np.float32, copy=False)
+ 
 
         stereo = self.engine.sound_process(
             data=[az_deg, 0.0, r],
@@ -175,12 +221,36 @@ class SofaSpatialiser:
             sourcePositions=self.engine.BRIR_sourcePositions,
         )
 
-        peak = np.max(np.abs(stereo))
-        if peak > 1.0:
-            stereo /= peak
+        # Ensure shape (N,2)
+        stereo = np.asarray(stereo, dtype=np.float32)
+        if stereo.ndim == 1:
+            stereo = np.stack([stereo, stereo], axis=1)
+        elif stereo.ndim == 2 and stereo.shape[0] == 2 and stereo.shape[1] != 2:
+            # sometimes returned as (2,N)
+            stereo = stereo.T
+
+        # 3) Trim again after convolution (BRIR can extend tail)
+        stereo = stereo[: int(self.fs_brir * self.clip_s), :] if self.clip_s > 0 else stereo
+
+        # 4) Downsample to 16kHz to shrink payload
+        if self.out_sr > 0 and self.out_sr != self.fs_brir:
+            left = signal.resample_poly(stereo[:, 0], self.out_sr, self.fs_brir)
+            right = signal.resample_poly(stereo[:, 1], self.out_sr, self.fs_brir)
+            stereo = np.stack([left, right], axis=1).astype(np.float32, copy=False)
+
+        # 5) Fade-in/out to avoid clicks
+        stereo[:, 0] = self._apply_fade(stereo[:, 0], self.out_sr, self.fade_ms)
+        stereo[:, 1] = self._apply_fade(stereo[:, 1], self.out_sr, self.fade_ms)
+
+        # 6) Normalize and keep some headroom, then clamp
+        peak = float(np.max(np.abs(stereo))) if stereo.size else 0.0
+        if peak > 0:
+            stereo *= min(1.0, self.max_peak / peak)
+        stereo = np.clip(stereo, -1.0, 1.0)
 
         buf = io.BytesIO()
-        sf.write(buf, stereo, self.fs, format="WAV", subtype="PCM_16")
+        # 7) 16-bit PCM WAV (small + universally playable)
+        sf.write(buf, stereo, int(self.out_sr), format="WAV", subtype="PCM_16")
         return buf.getvalue()
 
 
@@ -325,6 +395,11 @@ def main():
     spatialiser = SofaSpatialiser(
         sofa_path=deep_get(cfg, "sonification.sofa"),
         image_width=float(deep_get(cfg, "realsense.color_w", 640)),
+        # Smaller SOFA output to survive UDP:
+        out_sr=int(deep_get(cfg, "sonification.out_sr", 16000)),
+        clip_s=float(deep_get(cfg, "sonification.clip_s", 0.35)),
+        fade_ms=float(deep_get(cfg, "sonification.fade_ms", 8.0)),
+        max_peak=float(deep_get(cfg, "sonification.max_peak", 0.95)),
     )
 
     sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser)

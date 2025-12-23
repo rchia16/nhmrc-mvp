@@ -24,6 +24,7 @@ dependencies:
   - opencv
   - librosa
   - pynput
+  - pyyaml
   - pip
   - pip:
       - pyrealsense2
