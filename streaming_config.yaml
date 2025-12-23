@@ -36,10 +36,21 @@ audio:
   trust: true
   bt_reconnect_every: 5.0
   recv_reassembly_timeout_s: 1.0
-  keep_audio_files: false
+  keep_audio_files: true
   debug_udp: true
   send_chunk_bytes: 1200
-  send_inter_packet_sleep_s: 0.0
+  send_inter_packet_sleep_s: 0.01
+  # long-term streaming mode
+  stream:
+    enabled: true
+    port: 50030
+    sample_rate: 16000
+    channels: 2
+    frame_ms: 20
+    mtu_payload: 1400
+    sndbuf_bytes: 8388608
+    jitter_ms: 120
+    max_jitter_ms: 400
 
 yolo:
   model: "yolov8n.pt"
