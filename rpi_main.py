@@ -78,9 +78,9 @@ def _run_audio_bt_receiver(cfg, stop_evt: threading.Event):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True,
+    ap.add_argument("--config",
                     help="Path to nhmrc_streaming_config.yaml",
-                    default="./streaming_config.yml")
+                    default="./streaming_config.yaml")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
