@@ -46,6 +46,14 @@ from rs_d455_raw_udp_receiver import (
     ReceiverStats,
 )
 
+# Optional long-term PCM streaming (requires udp_pcm_stream.py in your project)
+try:
+    from udp_pcm_stream import PCMStreamUDPSender, PCMStreamParams
+except Exception:
+    PCMStreamUDPSender = None  # type: ignore
+    PCMStreamParams = None  # type: ignore
+
+
 # ---------------- PPG RECEIVER ----------------
 
 class PPGReceiverThread:
@@ -140,6 +148,22 @@ class UDPAudioBytesSender(bam.UDPAudioFileSender):
                 time.sleep(self.inter_packet_sleep_s)
             elif auto_pace_big_files and len(wav_bytes) >= 64 * 1024:
                 time.sleep(0.0008)
+
+def wav_bytes_to_pcm16_frames(wav_bytes: bytes, frame_bytes: int):
+    """
+    Decode WAV bytes to int16 interleaved stereo PCM frames of size frame_bytes.
+    Any remainder is dropped (for streaming).
+    """
+    bio = io.BytesIO(wav_bytes)
+    audio, sr = sf.read(bio, dtype="int16", always_2d=True)
+    # audio shape: (N, C)
+    if audio.shape[1] == 1:
+        # upmix mono -> stereo
+        audio = audio.repeat(2, axis=1)
+    pcm = audio.tobytes()
+    n = (len(pcm) // frame_bytes) * frame_bytes
+    for i in range(0, n, frame_bytes):
+        yield pcm[i:i + frame_bytes]
 
 
 # ---------------- SOFA SPATIALISER ----------------
@@ -262,12 +286,18 @@ class YoloSofaSonifier:
         cfg: Dict,
         audio_sender: UDPAudioBytesSender,
         spatialiser: SofaSpatialiser,
+        pcm_stream: Optional[object] = None,
+        pcm_params: Optional[object] = None,
     ):
         self.model = YOLO(deep_get(cfg, "yolo.model"))
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
 
         self.audio_sender = audio_sender
         self.spatialiser = spatialiser
+
+        # Long-term streaming path (if enabled)
+        self.pcm_stream = pcm_stream
+        self.pcm_params = pcm_params
 
         self.sound_map = deep_get(cfg, "sonification.sound_map", {})
         self.default_sound = deep_get(cfg, "sonification.default_sound")
@@ -345,8 +375,22 @@ class YoloSofaSonifier:
                 continue
 
             wav_bytes = self.spatialiser.spatialise_file(mono_path, az, r)
-            self.audio_sender.send_wav_bytes(f"{label}.wav", wav_bytes,
-                                             repeat_chunk0=self.repeat_chunk0)
+            # self.audio_sender.send_wav_bytes(f"{label}.wav", wav_bytes,
+            #                                  repeat_chunk0=self.repeat_chunk0)
+
+            # Preferred: continuous PCM streaming (no file reassembly / no per-clip player)
+            if self.pcm_stream is not None and self.pcm_params is not None:
+                frame_bytes = int(getattr(self.pcm_params, "frame_bytes"))
+                for frame in wav_bytes_to_pcm16_frames(wav_bytes, frame_bytes):
+                    self.pcm_stream.send_frame(frame)
+            else:
+                # Legacy: file-based UDP send (works, but can stall/flush on stop)
+                self.audio_sender.send_wav_bytes(
+                    f"{label}.wav",
+                    wav_bytes,
+                    repeat_chunk0=self.repeat_chunk0,
+                )
+
 
             print(f"[SOFA] {label} az={az:.1f} r={r:.2f}m bytes={len(wav_bytes)}")
 
@@ -402,7 +446,54 @@ def main():
         max_peak=float(deep_get(cfg, "sonification.max_peak", 0.95)),
     )
 
-    sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser)
+    # sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser)
+    # ---------- PCM streaming (long-term recommended) ----------
+    pcm_stream = None
+    pcm_params = None
+    if bool(deep_get(cfg, "audio.stream.enabled", False)):
+        if PCMStreamUDPSender is None or PCMStreamParams is None:
+            raise RuntimeError(
+                "audio.stream.enabled is true, but udp_pcm_stream.py could not be imported."
+            )
+
+        pcm_params = PCMStreamParams(
+            sample_rate=int(
+                deep_get(
+                    cfg, "audio.stream.sample_rate",
+                    deep_get(cfg, "sonification.out_sr", 16000)
+                )
+            ),
+            channels=int(deep_get(cfg, "audio.stream.channels", 2)),
+            frame_ms=int(deep_get(cfg, "audio.stream.frame_ms", 20)),
+            mtu_payload=int(deep_get(cfg, "audio.stream.mtu_payload", 1400)),
+        )
+
+        # Safety: ensure one frame fits in one UDP payload (this design expects that)
+        if int(getattr(pcm_params, "frame_bytes")) > \
+           int(deep_get(cfg, "audio.stream.mtu_payload", 1400)):
+            raise ValueError(
+                f"PCM frame_bytes={getattr(pcm_params,'frame_bytes')} exceeds "
+                f"mtu_payload={deep_get(cfg,'audio.stream.mtu_payload',1400)}. "
+                f"Reduce audio.stream.frame_ms or increase audio.stream.mtu_payload."
+            )
+
+        pcm_stream = PCMStreamUDPSender(
+            host=str(deep_get(cfg, "network.pi_ip")),
+            port=int(deep_get(cfg, "audio.stream.port", 50030)),
+            params=pcm_params,
+            sndbuf_bytes=int(deep_get(
+                cfg, "audio.stream.sndbuf_bytes", 8 * 1024 * 1024)
+            ),
+        )
+        print(
+            f"[PCM][TX] enabled -> {deep_get(cfg,'network.pi_ip')}:{deep_get(cfg,'audio.stream.port',50030)} "
+            f"sr={getattr(pcm_params,'sample_rate')} ch={getattr(pcm_params,'channels')} "
+            f"frame_ms={getattr(pcm_params,'frame_ms')} frame_bytes={getattr(pcm_params,'frame_bytes')}"
+        )
+
+    sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
+                                pcm_stream=pcm_stream,
+                                pcm_params=pcm_params)
 
     print("[PC] Running: RS → YOLO → SOFA → UDP → Pi")
 
@@ -417,6 +508,11 @@ def main():
     finally:
         rs_rx.stop()
         ppg_rx.stop()
+        if pcm_stream is not None:
+            try:
+                pcm_stream.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
