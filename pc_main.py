@@ -26,6 +26,7 @@ import random
 import struct
 import threading
 from typing import Dict, Optional, Tuple
+from dataclasses import dataclass
 
 import numpy as np
 import yaml
@@ -165,6 +166,18 @@ def wav_bytes_to_pcm16_frames(wav_bytes: bytes, frame_bytes: int):
     for i in range(0, n, frame_bytes):
         yield pcm[i:i + frame_bytes]
 
+def scale_pcm_int16(pcm_bytes: bytes, gain: float) -> bytes:
+    """
+    Scale int16 PCM audio by gain (e.g. 0.3 = 30% volume).
+    """
+    if gain >= 0.999:
+        return pcm_bytes
+
+    pcm = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    pcm *= float(gain)
+    np.clip(pcm, -32768, 32767, out=pcm)
+    return pcm.astype(np.int16).tobytes()
+
 
 # ---------------- SOFA SPATIALISER ----------------
 
@@ -216,21 +229,39 @@ class SofaSpatialiser:
         x[-n:] *= w[::-1]
         return x
 
-    def _trim_clip(self, audio: np.ndarray, sr: int) -> np.ndarray:
+    def _trim_clip(self, audio:np.ndarray, sr:int, clip_s_ovr:float=None) -> np.ndarray:
         """Keep only the first clip_s seconds (or entire signal if shorter)."""
-        if self.clip_s <= 0:
+        if clip_s_ovr is not None:
+            clip_s = clip_s_ovr
+        else:
+            clip_s = self.clip_s
+
+        if clip_s <= 0:
             return audio
-        n = int(sr * self.clip_s)
+        n = int(sr * clip_s)
         if n <= 0:
             return audio
         return audio[:n]
 
-    def spatialise_file(self, mono_path: str, az_deg: float, r: float) -> bytes:
+    def spatialise_array(
+        self,
+        mono_path: str,
+        az_deg: float,
+        r: float,
+        clip_override_s: Optional[float] = None,
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Spatialise and return float32 stereo array + sample rate.
+        Optional clip_override_s lets callers force a shorter windowed render.
+        """
+        clip_s = self.clip_s if clip_override_s is None else float(clip_override_s)
+
         audio, fs_src = sf.read(mono_path, dtype="float32", always_2d=False)
         audio = self._ensure_mono(audio)
 
         # 1) Trim early to reduce convolution cost
         audio = self._trim_clip(audio, fs_src)
+        audio = self._trim_clip(audio, fs_src, clip_s_ovr=clip_s)
 
         # 2) Resample source to BRIR sample rate for convolution
         if fs_src != self.fs_brir:
@@ -254,7 +285,7 @@ class SofaSpatialiser:
             stereo = stereo.T
 
         # 3) Trim again after convolution (BRIR can extend tail)
-        stereo = stereo[: int(self.fs_brir * self.clip_s), :] if self.clip_s > 0 else stereo
+        stereo = stereo[: int(self.fs_brir * clip_s), :] if clip_s > 0 else stereo
 
         # 4) Downsample to 16kHz to shrink payload
         if self.out_sr > 0 and self.out_sr != self.fs_brir:
@@ -272,10 +303,130 @@ class SofaSpatialiser:
             stereo *= min(1.0, self.max_peak / peak)
         stereo = np.clip(stereo, -1.0, 1.0)
 
+        return stereo.astype(np.float32, copy=False), int(self.out_sr)
+
+    def spatialise_file(self, mono_path: str, az_deg: float, r: float) -> bytes:
+        stereo, sr = self.spatialise_array(mono_path, az_deg, r)
         buf = io.BytesIO()
         # 7) 16-bit PCM WAV (small + universally playable)
-        sf.write(buf, stereo, int(self.out_sr), format="WAV", subtype="PCM_16")
+        # sf.write(buf, stereo, int(self.out_sr), format="WAV", subtype="PCM_16")
+        sf.write(buf, stereo, int(sr), format="WAV", subtype="PCM_16")
         return buf.getvalue()
+
+
+# ---------------- SCENE MIXDOWN ----------------
+
+
+@dataclass
+class SceneAudioEvent:
+    label: str
+    conf: float
+    area: float
+    az_deg: float
+    r: float
+    mono_path: str
+
+
+class SceneAudioWindowMixer:
+    """
+    Collect detections over a short window, spatialise them, and send a single
+    mixed clip (WAV or packetised PCM) to the Pi.
+    """
+    def __init__(
+        self,
+        spatialiser: SofaSpatialiser,
+        audio_sender: UDPAudioBytesSender,
+        pcm_stream: Optional[object],
+        pcm_params: Optional[object],
+        window_ms: int = 200,
+        max_objects: int = 3,
+        repeat_chunk0: int = 4,
+    ):
+        self.spatialiser = spatialiser
+        self.audio_sender = audio_sender
+        self.pcm_stream = pcm_stream
+        self.pcm_params = pcm_params
+        self.window_ms = int(window_ms)
+        self.max_objects = int(max_objects)
+        self.repeat_chunk0 = int(repeat_chunk0)
+
+        self.events: List[SceneAudioEvent] = []
+        self.window_start = time.time()
+
+    def add_event(self, event: SceneAudioEvent):
+        self.events.append(event)
+
+    def _mix_events(self, events: List[SceneAudioEvent]) -> Optional[bytes]:
+        if not events:
+            return None
+
+        # prioritize by confidence * area (bigger / more certain objects win)
+        ordered = sorted(events, key=lambda e: (e.conf * max(e.area, 1e-6)), reverse=True)
+        selected = ordered[: self.max_objects]
+
+        # fixed window length in samples
+        window_s = self.window_ms / 1000.0
+        stereo_mix: Optional[np.ndarray] = None
+        sr_out: Optional[int] = None
+
+        for ev in selected:
+            stereo, sr = self.spatialiser.spatialise_array(
+                ev.mono_path, ev.az_deg, ev.r, clip_override_s=window_s
+            )
+            target_samples = int(sr * window_s)
+            stereo = stereo[:target_samples]
+            if stereo.shape[0] < target_samples:
+                pad = np.zeros((target_samples - stereo.shape[0], 2), dtype=np.float32)
+                stereo = np.vstack([stereo, pad])
+
+            if stereo_mix is None:
+                stereo_mix = stereo
+                sr_out = sr
+            else:
+                # ensure same length
+                n = min(stereo_mix.shape[0], stereo.shape[0])
+                stereo_mix[:n, :] += stereo[:n, :]
+
+        if stereo_mix is None or sr_out is None:
+            return None
+
+        # normalize to avoid clipping when summing
+        peak = float(np.max(np.abs(stereo_mix))) if stereo_mix.size else 0.0
+        if peak > 1.0:
+            stereo_mix /= peak
+        stereo_mix = np.clip(stereo_mix, -1.0, 1.0)
+
+        buf = io.BytesIO()
+        sf.write(buf, stereo_mix, int(sr_out), format="WAV", subtype="PCM_16")
+        return buf.getvalue()
+
+    def maybe_flush(self, now: Optional[float] = None):
+        now = time.time() if now is None else now
+        if (now - self.window_start) * 1000.0 < self.window_ms:
+            return
+        self.flush(now)
+
+    def flush(self, now: Optional[float] = None):
+        now = time.time() if now is None else now
+        wav_bytes = self._mix_events(self.events)
+        self.events = []
+        self.window_start = now
+
+        if wav_bytes is None:
+            return
+
+        # Prefer continuous PCM streaming when available
+        if self.pcm_stream is not None and self.pcm_params is not None:
+            frame_bytes = int(getattr(self.pcm_params, "frame_bytes"))
+            for frame in wav_bytes_to_pcm16_frames(wav_bytes, frame_bytes):
+                self.pcm_stream.send_frame(frame)
+        else:
+            self.audio_sender.send_wav_bytes(
+                "scene_mix.wav",
+                wav_bytes,
+                repeat_chunk0=self.repeat_chunk0,
+            )
+
 
 
 # ---------------- YOLO + SONIFICATION ----------------
@@ -288,7 +439,9 @@ class YoloSofaSonifier:
         spatialiser: SofaSpatialiser,
         pcm_stream: Optional[object] = None,
         pcm_params: Optional[object] = None,
+        # volume: float = 0.3,
     ):
+        self.cfg = cfg
         self.model = YOLO(deep_get(cfg, "yolo.model"))
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
 
@@ -307,6 +460,18 @@ class YoloSofaSonifier:
             deep_get(cfg, "audio.per_label_cooldown_s", 0.5))
         self.repeat_chunk0 = int(deep_get(cfg, "audio.send_repeat_chunk0", 4))
 
+        self.scene_mixer = SceneAudioWindowMixer(
+            spatialiser=self.spatialiser,
+            audio_sender=self.audio_sender,
+            pcm_stream=self.pcm_stream,
+            pcm_params=self.pcm_params,
+            window_ms=int(deep_get(cfg, "audio.scene.window_ms", 200)),
+            max_objects=int(deep_get(cfg, "audio.scene.max_objects", 3)),
+            repeat_chunk0=self.repeat_chunk0,
+        )
+
+        # self.volume = volume
+
     def process(self, pkt: Dict):
         rgb = pkt["color"]
         depth = pkt.get("depth")
@@ -316,12 +481,16 @@ class YoloSofaSonifier:
         res = self.model(rgb, verbose=False)[0]
 
         if res.boxes is None:
+            self.scene_mixer.maybe_flush(time.time())
             return
 
         now = time.time()
+        self.scene_mixer.maybe_flush(now)
+        pending_events: List[SceneAudioEvent] = []
 
         for box in res.boxes:
-            if float(box.conf[0]) < self.conf:
+            conf = float(box.conf[0])
+            if conf < self.conf:
                 continue
 
             label = self.model.names[int(box.cls[0])]
@@ -330,7 +499,7 @@ class YoloSofaSonifier:
                 continue
 
             # --- compute bbox center in RGB space ---
-            x1, y1, x2, y2 = box.xyxy[0]
+            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
             cx_rgb = int((x1 + x2) / 2)
             cy_rgb = int((y1 + y2) / 2)
 
@@ -354,46 +523,32 @@ class YoloSofaSonifier:
                 if d > 0:
                     r = float(d) * depth_scale
 
-            # cx = int(box.xyxy[0][0] + box.xyxy[0][2]) // 2
-            # x_norm = cx / w
-            # az = -90.0 + 180.0 * x_norm
-
-            # r = 1.0
-            # if depth is not None:
-            #     d = depth[int(box.xyxy[0][1]), cx]
-            #     if d > 0:
-            #         r = float(d) * depth_scale
-
             # 1) cooldown (existing)
             if now - self.last_play.get(label, 0) < self.per_label_cooldown_s:
                 continue
             self.last_play[label] = now
 
-            # 2) UDP flood protection (new): per-label + global limiter
-            now_ms = int(now * 1000)
-            if not self.audio_sender.should_send(label, now_ms):
-                continue
-
-            wav_bytes = self.spatialiser.spatialise_file(mono_path, az, r)
-            # self.audio_sender.send_wav_bytes(f"{label}.wav", wav_bytes,
-            #                                  repeat_chunk0=self.repeat_chunk0)
-
-            # Preferred: continuous PCM streaming (no file reassembly / no per-clip player)
-            if self.pcm_stream is not None and self.pcm_params is not None:
-                frame_bytes = int(getattr(self.pcm_params, "frame_bytes"))
-                for frame in wav_bytes_to_pcm16_frames(wav_bytes, frame_bytes):
-                    self.pcm_stream.send_frame(frame)
-            else:
-                # Legacy: file-based UDP send (works, but can stall/flush on stop)
-                self.audio_sender.send_wav_bytes(
-                    f"{label}.wav",
-                    wav_bytes,
-                    repeat_chunk0=self.repeat_chunk0,
+            area = float((x2 - x1) * (y2 - y1)) / float(max(1.0, w * h))
+            pending_events.append(
+                SceneAudioEvent(
+                    label=label,
+                    conf=conf,
+                    area=area,
+                    az_deg=az,
+                    r=r,
+                    mono_path=mono_path,
                 )
+            )
 
+        for ev in pending_events:
+            self.scene_mixer.add_event(ev)
 
-            print(f"[SOFA] {label} az={az:.1f} r={r:.2f}m bytes={len(wav_bytes)}")
+        # Send one clip per window (packetised PCM preferred)
+        self.scene_mixer.maybe_flush(time.time())
 
+        if pending_events:
+            labels = ", ".join([ev.label for ev in pending_events])
+            print(f"[SOFA] window queued: {labels} (n={len(pending_events)})")
 
 # ---------------- MAIN ----------------
 
@@ -491,9 +646,11 @@ def main():
             f"frame_ms={getattr(pcm_params,'frame_ms')} frame_bytes={getattr(pcm_params,'frame_bytes')}"
         )
 
+    # volume = int(deep_get(cfg, "audio.stream.volume", 0.5))
     sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
                                 pcm_stream=pcm_stream,
-                                pcm_params=pcm_params)
+                                pcm_params=pcm_params,)
+                                # volume=volume)
 
     print("[PC] Running: RS → YOLO → SOFA → UDP → Pi")
 
