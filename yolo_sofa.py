@@ -528,11 +528,15 @@ class SpatialSoundHeadphoneYOLO:
         index_source = np.argmin(distances)
         BRIR_this = BRIRs[index_source, :, :]
 
-        signal_this_left = signal.convolve(10 * audio, BRIR_this[0, :], mode='full')
-        signal_this_right = signal.convolve(10 * audio, BRIR_this[1, :], mode='full')
+        signal_this_left = signal.convolve(10*audio, BRIR_this[0, :], mode='full')
+        signal_this_right = signal.convolve(10*audio, BRIR_this[1, :], mode='full')
         signal_this = np.stack((signal_this_left, signal_this_right), axis=-1)
 
-        return signal_this
+        peak = float(np.max(np.abs(signal_this)))
+        if peak > 0:
+            signal_this = (0.95 / peak) * signal_this
+
+        return signal_this.astype(np.float32, copy=False)
 
 
 if __name__ == "__main__":

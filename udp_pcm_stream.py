@@ -77,6 +77,7 @@ class PCMStreamUDPSender:
         params: PCMStreamParams,
         stream_id: Optional[int] = None,
         sndbuf_bytes: int = 8 * 1024 * 1024,
+        debug: bool = False,
     ):
         self.host = host
         self.port = port

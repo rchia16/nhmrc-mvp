@@ -38,15 +38,15 @@ audio:
   recv_reassembly_timeout_s: 1.0
   keep_audio_files: false
   debug_udp: true
-  send_chunk_bytes: 1200
+  send_chunk_bytes: 2400
   send_inter_packet_sleep_s: 0.05
   send_sndbuf_bytes: 8388608
   min_inter_file_gap_s: 0.15
   per_label_cooldown_s: 1.2
-  volume: 1.0
+  volume: 0.35
   scene:
-    window_ms: 1000
-    max_objects: 1
+    window_ms: 200
+    max_objects: 3
   # long-term streaming mode
   stream:
     enabled: true
