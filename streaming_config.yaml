@@ -42,6 +42,17 @@ audio:
   send_inter_packet_sleep_s: 0.01
   send_sndbuf_bytes: 8388608
   min_inter_file_gap_s: 0.15
+  # long-term streaming mode
+  stream:
+    enabled: true
+    port: 50030
+    sample_rate: 16000
+    channels: 2
+    frame_ms: 20
+    mtu_payload: 1400
+    sndbuf_bytes: 8388608
+    jitter_ms: 120
+    max_jitter_ms: 400
 
 yolo:
   model: "yolov8n.pt"
