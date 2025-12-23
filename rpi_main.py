@@ -92,7 +92,7 @@ def _run_audio_bt_receiver(cfg, stop_evt: threading.Event):
             listen_port=int(deep_get(cfg, "audio.stream.port", 50030)),
             params=p,
             alsa_device=deep_get(cfg, "audio.stream.alsa_device", None),
-            debug=bool(deep_get(cfg, "audio.debug_udp", False)),
+            debug=bool(deep_get(cfg, "audio.debug_udp", True)),
         )
         app.start()
     else:
@@ -104,7 +104,7 @@ def _run_audio_bt_receiver(cfg, stop_evt: threading.Event):
             bt_mac=str(deep_get(cfg, "audio.bt_mac", "")),
             tmp_dir=str(deep_get(cfg, "audio.tmp_dir", "/tmp/udp_audio")),
             keep_files=bool(deep_get(cfg, "audio.keep_audio_files", False)),
-            debug=bool(deep_get(cfg, "audio.debug_udp", False)),
+            debug=bool(deep_get(cfg, "audio.debug_udp", True)),
         )
         app.start()
 
