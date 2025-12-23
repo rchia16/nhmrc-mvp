@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pc_receive_sensors_yolo_sonify_send_audio.py
+pc_main.py
 
 PC-side orchestrator (library-aligned):
 
@@ -13,7 +13,7 @@ PC-side orchestrator (library-aligned):
   using bth_audio_manager.py protocol
 
 Run:
-  python3 pc_receive_sensors_yolo_sonify_send_audio.py --config nhmrc_streaming_config.yaml
+  python pc_main.py --config nhmrc_streaming_config.yaml
 """
 
 from __future__ import annotations
@@ -165,18 +165,6 @@ def wav_bytes_to_pcm16_frames(wav_bytes: bytes, frame_bytes: int):
     n = (len(pcm) // frame_bytes) * frame_bytes
     for i in range(0, n, frame_bytes):
         yield pcm[i:i + frame_bytes]
-
-def scale_pcm_int16(pcm_bytes: bytes, gain: float) -> bytes:
-    """
-    Scale int16 PCM audio by gain (e.g. 0.3 = 30% volume).
-    """
-    if gain >= 0.999:
-        return pcm_bytes
-
-    pcm = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
-    pcm *= float(gain)
-    np.clip(pcm, -32768, 32767, out=pcm)
-    return pcm.astype(np.int16).tobytes()
 
 
 # ---------------- SOFA SPATIALISER ----------------
@@ -439,7 +427,6 @@ class YoloSofaSonifier:
         spatialiser: SofaSpatialiser,
         pcm_stream: Optional[object] = None,
         pcm_params: Optional[object] = None,
-        # volume: float = 0.3,
     ):
         self.cfg = cfg
         self.model = YOLO(deep_get(cfg, "yolo.model"))
@@ -469,8 +456,6 @@ class YoloSofaSonifier:
             max_objects=int(deep_get(cfg, "audio.scene.max_objects", 3)),
             repeat_chunk0=self.repeat_chunk0,
         )
-
-        # self.volume = volume
 
     def process(self, pkt: Dict):
         rgb = pkt["color"]
@@ -646,11 +631,9 @@ def main():
             f"frame_ms={getattr(pcm_params,'frame_ms')} frame_bytes={getattr(pcm_params,'frame_bytes')}"
         )
 
-    # volume = int(deep_get(cfg, "audio.stream.volume", 0.5))
     sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
                                 pcm_stream=pcm_stream,
-                                pcm_params=pcm_params,)
-                                # volume=volume)
+                                pcm_params=pcm_params)
 
     print("[PC] Running: RS → YOLO → SOFA → UDP → Pi")
 

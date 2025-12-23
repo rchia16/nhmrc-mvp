@@ -5,7 +5,7 @@ import threading
 import soundfile as sf
 import sounddevice as sd
 from pythonosc import dispatcher, osc_server
-from queue import Queue
+from collections import deque
 import numpy as np
 import time
 from os.path import join
@@ -66,6 +66,10 @@ class SpatialSoundHeadphoneYOLO:
         self.message = None
         self.playing = False
 
+        # Scene timing
+        self.inter_object_gap_s = 0.1
+        self.scene_play_time_s = 2.0
+
         self.verbose = verbose
 
         # Optional per-class cooldown across scenes (can be small or 0.0)
@@ -104,6 +108,61 @@ class SpatialSoundHeadphoneYOLO:
         self.current_scene_id = None
         self.current_scene_objects = []   # list of (cid, obj_dict)
         self.current_scene_index = 0
+        self.current_scene_start_t = None
+
+        # ---- Streaming buffer (continuous playback) ----
+        self._audio_buffer = deque()
+        self._audio_buffer_pos = 0
+        self._buffer_lock = threading.Lock()
+        self._stream = None
+
+    # ------------------------------------------------------------------
+    # Audio streaming helpers
+    # ------------------------------------------------------------------
+    def _stream_callback(self, outdata, frames, time_info, status):
+        if status:
+            print(f"[STREAM] status: {status}")
+        outdata.fill(0.0)
+        with self._buffer_lock:
+            remaining = frames
+            while remaining > 0 and self._audio_buffer:
+                chunk = self._audio_buffer[0]
+                take = min(remaining, chunk.shape[0] - self._audio_buffer_pos)
+                outdata[frames - remaining: frames - remaining + take, :] = \
+                    chunk[self._audio_buffer_pos:self._audio_buffer_pos + take]
+                self._audio_buffer_pos += take
+                remaining -= take
+                if self._audio_buffer_pos >= chunk.shape[0]:
+                    self._audio_buffer.popleft()
+                    self._audio_buffer_pos = 0
+
+    def _start_stream(self):
+        if self._stream is not None:
+            return
+        self._stream = sd.OutputStream(
+            samplerate=self.BRIR_samplerate,
+            channels=2,
+            dtype='float32',
+            callback=self._stream_callback,
+        )
+        self._stream.start()
+
+    def enqueue_audio(self, audio_array: np.ndarray):
+        if audio_array is None or audio_array.size == 0:
+            return
+        audio = np.asarray(audio_array, dtype=np.float32)
+        if audio.ndim == 1:
+            audio = np.stack([audio, audio], axis=-1)
+        with self._buffer_lock:
+            self._audio_buffer.append(audio)
+
+    def enqueue_gap(self):
+        gap_frames = int(self.inter_object_gap_s * self.BRIR_samplerate)
+        if gap_frames <= 0:
+            return
+        silence = np.zeros((gap_frames, 2), dtype=np.float32)
+        with self._buffer_lock:
+            self._audio_buffer.append(silence)
 
         # ---- Playback thread ----
         self.read_queue_manager_thread = threading.Thread(
@@ -169,6 +228,7 @@ class SpatialSoundHeadphoneYOLO:
     # ------------------------------------------------------------------
     def start(self):
         print('Starting OSC server for YOLO detections...')
+        self._start_stream()
         self.read_queue_manager_thread.start()
         self.OSCserver.serve_forever()
 
@@ -199,6 +259,7 @@ class SpatialSoundHeadphoneYOLO:
                     self.current_scene_id = None
                     self.current_scene_objects = []
                     self.current_scene_index = 0
+                    self.current_scene_start_t = None
 
                     if not self.scene_order:
                         # No scenes waiting; idle for a bit
@@ -234,6 +295,7 @@ class SpatialSoundHeadphoneYOLO:
                     self.current_scene_id = next_scene_id
                     self.current_scene_objects = items
                     self.current_scene_index = 0
+                    self.current_scene_start_t = time.time()
 
                     if self.verbose:
                         az_list = [obj["spherical"][0] for _, obj in items]
@@ -247,6 +309,14 @@ class SpatialSoundHeadphoneYOLO:
                     cid, obj = self.current_scene_objects[self.current_scene_index]
                     sound_key = obj["sound_key"]
                     spherical = obj["spherical"]
+
+                    if self.current_scene_start_t is not None and \
+                       (time.time() - self.current_scene_start_t) >= self.scene_play_time_s:
+                        if self.verbose:
+                            print(f"[SCENE] Scene {self.current_scene_id} exceeded "
+                                  f"{self.scene_play_time_s}s, skipping remaining objects.")
+                        self.current_scene_index = len(self.current_scene_objects)
+                        continue
 
                     if sound_key not in self.yolo_sounds:
                         if self.verbose:
@@ -287,7 +357,8 @@ class SpatialSoundHeadphoneYOLO:
                                   f"object index {self.current_scene_index}, cid={cid}, "
                                   f"key={sound_key}, az={spherical[0]:.1f}")
                         self.playing = True
-                        self.play_sound(audio_to_play)
+                        self.enqueue_audio(audio_to_play)
+                        self.enqueue_gap()
                         self.playing = False
                         self.last_play_time[cid] = time.time()
                     else:
@@ -300,8 +371,7 @@ class SpatialSoundHeadphoneYOLO:
                     # Nothing to play right now
                     time.sleep(0.02)
             else:
-                # Shouldn't really happen because play_sound is blocking,
-                # but keep for safety.
+                # Give the audio callback room to drain the buffer
                 time.sleep(0.01)
 
     # ------------------------------------------------------------------
@@ -396,10 +466,11 @@ class SpatialSoundHeadphoneYOLO:
     # Playback helpers
     # ------------------------------------------------------------------
     def play_sound(self, signal_to_play):
-        sd.play(signal_to_play, mapping=[1, 2])
-        sd.wait()
-        if self.verbose:
-            print('!----------------- END sound')
+        """
+        Legacy helper kept for compatibility; now simply enqueues audio into
+        the streaming buffer for non-blocking playback.
+        """
+        self.enqueue_audio(signal_to_play)
 
     # ------------------------------------------------------------------
     # Sound preparation
