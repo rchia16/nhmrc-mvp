@@ -167,10 +167,10 @@ def main():
     signal.signal(signal.SIGTERM, _sig_handler)
 
     threads = [
-        threading.Thread(target=_run_rs_sender, args=(cfg, stop_evt), daemon=True),
-        threading.Thread(target=_run_ppg_stream, args=(cfg, stop_evt), daemon=True),
-        # threading.Thread(target=_run_audio_bt_receiver, args=(cfg, stop_evt), daemon=True),
         threading.Thread(target=_run_depth_ordered_spatialiser, args=(cfg, stop_evt), daemon=True),
+        threading.Thread(target=_run_ppg_stream, args=(cfg, stop_evt), daemon=True),
+        threading.Thread(target=_run_rs_sender, args=(cfg, stop_evt), daemon=True),
+        # threading.Thread(target=_run_audio_bt_receiver, args=(cfg, stop_evt), daemon=True),
     ]
 
     for t in threads:

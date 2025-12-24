@@ -116,6 +116,15 @@ class SpatialSoundHeadphoneYOLO:
         self._buffer_lock = threading.Lock()
         self._stream = None
 
+        # ---- Playback thread ----
+        # Start-ready as soon as the Pi process launches so streaming is
+        # available immediately.
+        self.read_queue_manager_thread = threading.Thread(
+            target=self.read_queue_manager,
+            args=(),
+            daemon=True
+        )        
+
     # ------------------------------------------------------------------
     # Audio streaming helpers
     # ------------------------------------------------------------------
@@ -163,13 +172,6 @@ class SpatialSoundHeadphoneYOLO:
         silence = np.zeros((gap_frames, 2), dtype=np.float32)
         with self._buffer_lock:
             self._audio_buffer.append(silence)
-
-        # ---- Playback thread ----
-        self.read_queue_manager_thread = threading.Thread(
-            target=self.read_queue_manager,
-            args=(),
-            daemon=True
-        )
 
     # ------------------------------------------------------------------
     # Setup
@@ -229,7 +231,8 @@ class SpatialSoundHeadphoneYOLO:
     def start(self):
         print('Starting OSC server for YOLO detections...')
         self._start_stream()
-        self.read_queue_manager_thread.start()
+        if not self.read_queue_manager_thread.is_alive():
+            self.read_queue_manager_thread.start()
         self.OSCserver.serve_forever()
 
     # ------------------------------------------------------------------
@@ -483,9 +486,13 @@ class SpatialSoundHeadphoneYOLO:
                 print("YOLO audio source is None.")
             return None
 
-        # Downmix stereo -> mono for BRIR convolution
-        if is_mono and audio_src.ndim == 2:
+        # Downmix multi-channel -> mono for BRIR convolution (required so the
+        # impulse response kernel dimensionality matches the audio signal).
+        if audio_src.ndim > 1:
+            if self.verbose:
+                print(f"[YOLO] Downmixing {audio_src.shape[1]}-channel audio to mono")
             audio_src = audio_src.mean(axis=1)
+            is_mono = True
 
         try:
             spherical = self.message['yolo_spherical']
@@ -556,6 +563,9 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
 
         if not args:
             return
+
+        if self.verbose:
+            print(f"[OSC] {address} args={args}")
 
         raw_x = float(args[0])
         extras = list(args[1:])
