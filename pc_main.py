@@ -41,11 +41,13 @@ import bth_audio_manager as bam
 from yolo_sofa import SpatialSoundHeadphoneYOLO
 from config import deep_get, load_config
 
-# ✅ NEW: import updated receiver library
+# import updated receiver library
 from rs_d455_raw_udp_receiver import (
     RealSenseRawUDPReceiver,
     ReceiverStats,
 )
+
+from rgbd_coord_streamer import App as VisAudioStreamer
 
 # Optional long-term PCM streaming (requires udp_pcm_stream.py in your project)
 try:
@@ -535,6 +537,8 @@ class YoloSofaSonifier:
             labels = ", ".join([ev.label for ev in pending_events])
             print(f"[SOFA] window queued: {labels} (n={len(pending_events)})")
 
+
+
 # ---------------- MAIN ----------------
 
 def main():
@@ -551,7 +555,6 @@ def main():
         timeout_ms=int(deep_get(cfg, "realsense.rs_timeout_ms", 200)),
         max_inflight=int(deep_get(cfg, "realsense.max_inflight", 8)),
     )
-    rs_rx.start()
 
     # ---------- PPG ----------
     ppg_rx = PPGReceiverThread(
@@ -635,9 +638,15 @@ def main():
                                 pcm_stream=pcm_stream,
                                 pcm_params=pcm_params)
 
-    print("[PC] Running: RS → YOLO → SOFA → UDP → Pi")
+    print("[PC] Running: RS → YOLO → UDP → Pi → SOFA")
+
+    av_stream = VisAudioStreamer(cfg, rs_rx=rs_rx)
 
     try:
+        # Run the RGB-D visual/audio streamer in the background (shares the
+        # same UDP socket)
+        av_stream.start(background=True)
+        rs_rx.start()
         while True:
             pkt = rs_rx.get_latest()
             if pkt:
@@ -646,6 +655,7 @@ def main():
     except KeyboardInterrupt:
         print("\n[PC] Shutdown")
     finally:
+        av_stream.stop()
         rs_rx.stop()
         ppg_rx.stop()
         if pcm_stream is not None:
