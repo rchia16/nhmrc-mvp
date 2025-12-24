@@ -90,10 +90,33 @@ def _run_depth_ordered_spatialiser(cfg, stop_evt: threading.Event):
     sofa_path = deep_get(cfg, "sonification.sofa", "./sofa-lib/BRIR_HATS_3degree_for_glasses.sofa")
     image_width = float(deep_get(cfg, "realsense.color_w", 640))
     osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
+    bt_connect_timeout_s = deep_get(cfg, "audio.bt_connect_timeout_s", 20.0)
 
-    app = DepthAwareSpatialSound(sofa_file_path=sofa_path,
-                                 image_width=image_width, osc_port=osc_port,
-                                 verbose=True)
+    output_blocksize = deep_get(cfg, "audio.output_blocksize")
+    output_latency_s = deep_get(cfg, "audio.output_latency_s")
+    if output_blocksize is not None:
+        try:
+            output_blocksize = int(output_blocksize)
+        except (TypeError, ValueError):
+            output_blocksize = None
+    if output_latency_s is not None:
+        try:
+            output_latency_s = float(output_latency_s)
+        except (TypeError, ValueError):
+            output_latency_s = None
+
+    app = DepthAwareSpatialSound(
+        sofa_file_path=sofa_path,
+        image_width=image_width,
+        osc_port=osc_port,
+        verbose=True,
+        bt_mac=str(deep_get(cfg, "audio.bt_mac", "")) or None,
+        bt_pair=bool(deep_get(cfg, "audio.pair", False)),
+        bt_trust=bool(deep_get(cfg, "audio.trust", True)),
+        bt_connect_timeout_s=float(bt_connect_timeout_s),
+        output_blocksize=output_blocksize,
+        output_latency_s=output_latency_s,
+    )
 
     thread = threading.Thread(target=app.start, daemon=True)
     thread.start()

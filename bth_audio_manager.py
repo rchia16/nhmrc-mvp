@@ -105,6 +105,15 @@ class BluetoothSpeakerManager:
         if rc == 124:
             raise RuntimeError("[BT] bluetoothctl timed out (is bluetoothd running?)")
 
+    def is_connected(self) -> bool:
+        """Return True if bluetoothctl reports the device as connected."""
+        rc, out = self._run_btctl([f"info {self.mac}", "quit"], timeout_s=10.0)
+        if rc == 124:
+            print("[BT] connection check timed out")
+            return False
+        print("[BT] info output:\n" + out.strip())
+        return "Connected: yes" in out
+
     def disconnect(self) -> None:
         rc, out = self._run_btctl([f"disconnect {self.mac}", "quit"], timeout_s=10.0)
         print("[BT] disconnect output:\n" + out.strip())

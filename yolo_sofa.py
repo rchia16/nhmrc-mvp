@@ -10,6 +10,8 @@ import numpy as np
 import time
 from os.path import join
 
+from bth_audio_manager import BluetoothSpeakerManager
+
 # --- SOFA files ---
 sofa_lib = './sofa-lib/'
 sofa_glasses_file = join(sofa_lib, "./BRIR_HATS_3degree_for_glasses.sofa")
@@ -59,18 +61,37 @@ class SpatialSoundHeadphoneYOLO:
     def __init__(self,
                  sofa_file_path=sofa_glasses_file,
                  image_width=640.0,
-                 verbose=False):
+                 verbose=False,
+                 bt_mac: str | None = None,
+                 bt_pair: bool = False,
+                 bt_trust: bool = True,
+                 bt_connect_timeout_s: float = 20.0,
+                 output_blocksize: int | None = None,
+                 output_latency_s: float | None = None):
         # ---- Config ----
         self.image_width = float(image_width)
         self.yolo_counter = 0
         self.message = None
         self.playing = False
 
+        self.bt_manager = None
+        if bt_mac:
+            self.bt_manager = BluetoothSpeakerManager(
+                bt_mac,
+                pair=bt_pair,
+                trust=bt_trust,
+                connect_timeout_s=bt_connect_timeout_s,
+            )
+
         # Scene timing
         self.inter_object_gap_s = 0.1
         self.scene_play_time_s = 2.0
 
         self.verbose = verbose
+
+        # Allow tuning playback latency to reduce output underflows on Pi
+        self.output_blocksize = output_blocksize
+        self.output_latency_s = output_latency_s
 
         # Optional per-class cooldown across scenes (can be small or 0.0)
         self.min_interval_between_plays = 0.0
@@ -94,9 +115,11 @@ class SpatialSoundHeadphoneYOLO:
         # ---- Audio device / samplerate ----
         # sd.default.device = 'Speakers (Realtek(R) Audio), Windows DirectSound'
         sd.default.samplerate = self.BRIR_samplerate
+        self._log_output_device_info(prefix="[AUDIO] Configured")
 
         # ---- Load YOLO sound sources (different objects → different sounds) ----
         self.setup_audio_sources()
+        self._report_audio_source_rates()
 
         # ---- Scene management ----
         # frame_id -> {cid: {"spherical": np.array, "sound_key": str}}
@@ -124,6 +147,56 @@ class SpatialSoundHeadphoneYOLO:
             args=(),
             daemon=True
         )        
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    def _log_output_device_info(self, prefix: str = "[AUDIO]") -> None:
+        """Print output-device capabilities and chosen samplerate/channels."""
+        try:
+            output_dev = sd.default.device
+            if isinstance(output_dev, (list, tuple)):
+                output_dev_idx = output_dev[1] if len(output_dev) > 1 else None
+            else:
+                output_dev_idx = output_dev
+
+            dev_info = sd.query_devices(output_dev_idx)
+            hostapi = sd.query_hostapis(dev_info['hostapi'])
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            print(f"{prefix} Unable to query output device info: {exc}")
+            return
+
+        active_sr = getattr(self._stream, "samplerate", None)
+        active_ch = getattr(self._stream, "channels", None)
+        active_dev = getattr(self._stream, "device", output_dev_idx)
+
+        print(
+            f"{prefix} device='{dev_info.get('name')}' (id={active_dev}, "
+            f"hostapi={hostapi.get('name')}), "
+            f"max_output_channels={dev_info.get('max_output_channels')}, "
+            f"default_samplerate={dev_info.get('default_samplerate')}, "
+            f"configured_samplerate={self.BRIR_samplerate}, "
+            f"active_samplerate={active_sr}, active_channels={active_ch}, "
+            f"blocksize={self.output_blocksize}, latency={self.output_latency_s}"
+        )
+
+        if self.output_blocksize is None or self.output_latency_s is None:
+            print(
+                f"{prefix} Hint: set audio.output_blocksize / audio.output_latency_s "
+                "in config to raise buffer/latency and reduce underflows"
+            )
+
+    def _report_audio_source_rates(self) -> None:
+        """Log sample rate and channel count for each loaded sound vs. BRIR."""
+        for key, (audio, fs) in self.yolo_sounds.items():
+            if audio is None or fs is None:
+                continue
+            channels = 1 if audio.ndim == 1 else audio.shape[1]
+            mismatch = "OK" if fs == self.BRIR_samplerate else "MISMATCH"
+            print(
+                f"[AUDIO] Source '{key}' rate={fs} Hz channels={channels} "
+                f"({mismatch} vs BRIR {self.BRIR_samplerate} Hz)"
+            )
 
     # ------------------------------------------------------------------
     # Audio streaming helpers
@@ -155,6 +228,14 @@ class SpatialSoundHeadphoneYOLO:
             callback=self._stream_callback,
         )
         self._stream.start()
+        self._log_output_device_info(prefix="[AUDIO] Active stream")
+
+    @staticmethod
+    def _log_output_rms(audio_to_play: np.ndarray) -> None:
+        if audio_to_play is None or audio_to_play.size == 0:
+            return
+        rms = float(np.sqrt(np.mean(np.square(audio_to_play.astype(np.float32)))))
+        print(f"[OSC] RMS destined for speaker: {rms:.6f}")
 
     def enqueue_audio(self, audio_array: np.ndarray):
         if audio_array is None or audio_array.size == 0:
@@ -230,6 +311,12 @@ class SpatialSoundHeadphoneYOLO:
     # ------------------------------------------------------------------
     def start(self):
         print('Starting OSC server for YOLO detections...')
+        if self.bt_manager:
+            try:
+                self.bt_manager.ensure_connected()
+                print(f"[BT] connected? {self.bt_manager.is_connected()}")
+            except Exception as e:
+                print(f"[BT] initial connect failed: {e}")
         self._start_stream()
         if not self.read_queue_manager_thread.is_alive():
             self.read_queue_manager_thread.start()
@@ -359,6 +446,7 @@ class SpatialSoundHeadphoneYOLO:
                             print(f"[SCENE] Playing scene {self.current_scene_id}, "
                                   f"object index {self.current_scene_index}, cid={cid}, "
                                   f"key={sound_key}, az={spherical[0]:.1f}")
+                        self._log_output_rms(audio_to_play)
                         self.playing = True
                         self.enqueue_audio(audio_to_play)
                         self.enqueue_gap()
@@ -686,6 +774,7 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
                         self.yolo_counter += 1
 
                         if audio_to_play is not None:
+                            self._log_output_rms(audio_to_play)
                             self.enqueue_audio(audio_to_play)
                             self.enqueue_gap()
                             self.playing = False
