@@ -7,6 +7,7 @@ import sounddevice as sd
 from pythonosc import dispatcher, osc_server
 from collections import deque
 import numpy as np
+import platform
 import time
 from os.path import join
 
@@ -76,12 +77,15 @@ class SpatialSoundHeadphoneYOLO:
 
         self.bt_manager = None
         if bt_mac:
-            self.bt_manager = BluetoothSpeakerManager(
-                bt_mac,
-                pair=bt_pair,
-                trust=bt_trust,
-                connect_timeout_s=bt_connect_timeout_s,
-            )
+            if platform.system().lower() == 'linux':
+                self.bt_manager = BluetoothSpeakerManager(
+                    bt_mac,
+                    pair=bt_pair,
+                    trust=bt_trust,
+                    connect_timeout_s=bt_connect_timeout_s,
+                )
+            else:
+                print("[BT] bluetoothctl not available; skipping autoconnect")
 
         # Scene timing
         self.inter_object_gap_s = 0.1
@@ -112,11 +116,6 @@ class SpatialSoundHeadphoneYOLO:
         self.BRIR_samplerate = sofa.getSamplingRate()
         self.BRIR_sourcePositions = sofa.getVariableValue('SourcePosition')  # phi, theta, r
 
-        # ---- Audio device / samplerate ----
-        # sd.default.device = 'Speakers (Realtek(R) Audio), Windows DirectSound'
-        sd.default.samplerate = self.BRIR_samplerate
-        self._log_output_device_info(prefix="[AUDIO] Configured")
-
         # ---- Load YOLO sound sources (different objects → different sounds) ----
         self.setup_audio_sources()
         self._report_audio_source_rates()
@@ -139,6 +138,11 @@ class SpatialSoundHeadphoneYOLO:
         self._buffer_lock = threading.Lock()
         self._stream = None
 
+        # ---- Audio device / samplerate ----
+        # sd.default.device = 'Speakers (Realtek(R) Audio), Windows DirectSound'
+        sd.default.samplerate = self.BRIR_samplerate
+        self._log_output_device_info(prefix="[AUDIO] Configured")
+
         # ---- Playback thread ----
         # Start-ready as soon as the Pi process launches so streaming is
         # available immediately.
@@ -160,7 +164,10 @@ class SpatialSoundHeadphoneYOLO:
             else:
                 output_dev_idx = output_dev
 
-            dev_info = sd.query_devices(output_dev_idx)
+            dev_info = sd.query_devices(output_dev_idx, kind="output")
+            # Force output-only device to avoid input/output tuple mismatches
+            if output_dev_idx is not None:
+                sd.default.device = output_dev_idx
             hostapi = sd.query_hostapis(dev_info['hostapi'])
         except Exception as exc:  # noqa: BLE001 - diagnostics only
             print(f"{prefix} Unable to query output device info: {exc}")
@@ -266,19 +273,38 @@ class SpatialSoundHeadphoneYOLO:
 
         def safe_load(path):
             try:
-                audio, fs = sf.read(path)
+                audio, fs = sf.read(path, always_2d=False)
                 print(f"Loaded audio: {path}")
                 return audio, fs
             except Exception as e:
                 print(f"Error loading audio file {path}: {e}")
                 return None, None
 
+        def to_stereo_at_brir_rate(audio, fs):
+            """Ensure audio matches BRIR samplerate and is stereo."""
+            if audio is None or fs is None:
+                return None, None
+            audio = np.asarray(audio, dtype=np.float32)
+            if audio.ndim == 1:
+                audio = np.stack([audio, audio], axis=1)
+            target_fs = int(self.BRIR_samplerate)
+            if fs != target_fs:
+                audio = signal.resample_poly(audio, target_fs, int(fs), axis=0)
+                fs = target_fs
+            return audio, fs
+
         # Load all candidate sounds
-        audio_default, fs_default = safe_load(scifi_sound_file)
-        audio_retro,   fs_retro   = safe_load(retro_sound_file)
-        audio_arcade,  fs_arcade  = safe_load(arcade_sound_file)
-        audio_unlock,  fs_unlock  = safe_load(unlock_sound_file)
-        audio_shortz,  fs_shortz  = safe_load(shortz_sound_file)
+        default = to_stereo_at_brir_rate(*safe_load(scifi_sound_file))
+        retro   = to_stereo_at_brir_rate(*safe_load(retro_sound_file))
+        arcade  = to_stereo_at_brir_rate(*safe_load(arcade_sound_file))
+        unlock  = to_stereo_at_brir_rate(*safe_load(unlock_sound_file))
+        shortz  = to_stereo_at_brir_rate(*safe_load(shortz_sound_file))
+
+        audio_default, fs_default = default
+        audio_retro,   fs_retro   = retro
+        audio_arcade,  fs_arcade  = arcade
+        audio_unlock,  fs_unlock  = unlock
+        audio_shortz,  fs_shortz  = shortz
 
         # Default sound (used when no specific class mapping found)
         if audio_default is not None:
