@@ -41,6 +41,7 @@ audio:
   send_chunk_bytes: 1200
   send_inter_packet_sleep_s: 0.05
   send_sndbuf_bytes: 8388608
+  send_repeat_chunk0: 1
   min_inter_file_gap_s: 0.15
   per_label_cooldown_s: 1.2
   volume: 1.0
@@ -61,11 +62,12 @@ audio:
 
 yolo:
   model: "yolov8n.pt"
-  conf: 0.30
+  conf: 0.50 # 0.30
   stable_seconds: 0.20
   forget_seconds: 1.00
   cooldown_seconds: 0.60
   yolo_hz: 10.0
+  max_det: 4
 
 sonification:
   default_sound: "./sound-lib/ui_sci-fi-sound-36061.wav"
