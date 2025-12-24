@@ -92,33 +92,52 @@ class YoloDepthOSCStreamer:
 
 
 class App:
-    def __init__(self, cfg: Dict):
+    def __init__(self, cfg: Dict, rs_rx: RealSenseRawUDPReceiver | None = None):
         self.cfg = cfg
         self.stop_evt = threading.Event()
         self.streamer = YoloDepthOSCStreamer(cfg)
 
-        self.rx = RealSenseRawUDPReceiver(
-            listen_ip=str(deep_get(cfg, "network.pc_listen_ip", "0.0.0.0")),
-            port=int(deep_get(cfg, "ports.rs_udp", 50010)),
-            timeout_ms=int(deep_get(cfg, "realsense.rs_timeout_ms", 200)),
-            max_inflight=int(deep_get(cfg, "realsense.max_inflight", 8)),
-            on_frame=self.streamer.on_frame,
-        )
+        self._own_rx = rs_rx is None
+        if rs_rx is None:
+            rs_rx = RealSenseRawUDPReceiver(
+                listen_ip=str(deep_get(cfg, "network.pc_listen_ip", "0.0.0.0")),
+                port=int(deep_get(cfg, "ports.rs_udp", 50010)),
+                timeout_ms=int(deep_get(cfg, "realsense.rs_timeout_ms", 200)),
+                max_inflight=int(deep_get(cfg, "realsense.max_inflight", 8)),
+                on_frame=self.streamer.on_frame,
+            )
+        else:
+            # share an existing receiver (pc_main) without rebinding the socket
+            rs_rx.on_frame = self.streamer.on_frame
 
-    def start(self):
+        self.rx = rs_rx
+        self._thread: threading.Thread | None = None
+
+    def _run(self):
         self.rx.start()
 
         try:
             while not self.stop_evt.is_set():
                 time.sleep(0.2)
         finally:
-            try:
-                self.rx.stop()
-            except Exception:
-                pass
+            if self._own_rx:
+                try:
+                    self.rx.stop()
+                except Exception:
+                    pass
+
+    def start(self, background: bool = False):
+        if background:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, daemon=True)
+                self._thread.start()
+        else:
+            self._run()
 
     def stop(self):
         self.stop_evt.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
 
 
 if __name__ == "__main__":

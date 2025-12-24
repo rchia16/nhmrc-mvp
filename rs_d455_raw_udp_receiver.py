@@ -263,6 +263,12 @@ class RealSenseRawUDPReceiver:
 
     def run_forever(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except OSError:
+            # Ignore if unsupported on the platform
+            pass
+
         sock.bind((self.listen_ip, self.port))
         sock.settimeout(0.5)
         try:

@@ -555,7 +555,6 @@ def main():
         timeout_ms=int(deep_get(cfg, "realsense.rs_timeout_ms", 200)),
         max_inflight=int(deep_get(cfg, "realsense.max_inflight", 8)),
     )
-    rs_rx.start()
 
     # ---------- PPG ----------
     ppg_rx = PPGReceiverThread(
@@ -635,16 +634,19 @@ def main():
             f"frame_ms={getattr(pcm_params,'frame_ms')} frame_bytes={getattr(pcm_params,'frame_bytes')}"
         )
 
-        sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
-                                    pcm_stream=pcm_stream,
-                                    pcm_params=pcm_params)
+    sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
+                                pcm_stream=pcm_stream,
+                                pcm_params=pcm_params)
 
     print("[PC] Running: RS → YOLO → UDP → Pi → SOFA")
 
-    av_stream = VisAudioStreamer(cfg)
+    av_stream = VisAudioStreamer(cfg, rs_rx=rs_rx)
 
     try:
-        av_stream.start()
+        # Run the RGB-D visual/audio streamer in the background (shares the
+        # same UDP socket)
+        av_stream.start(background=True)
+        rs_rx.start()
         while True:
             pkt = rs_rx.get_latest()
             if pkt:
