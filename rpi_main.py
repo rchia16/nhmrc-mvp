@@ -8,8 +8,6 @@ import numpy as np
 
 from config import load_config, deep_get
 from udp_pcm_stream import PCMStreamPlayerApp, PCMStreamParams
-from yolo_sofa import DepthAwareSpatialSound, SpatialSoundHeadphoneYOLO
-from pythonosc import dispatcher, osc_server
 
 
 
@@ -80,56 +78,6 @@ def _run_audio_bt_receiver_wait(cfg, stop_evt: threading.Event):
     finally:
         stop_evt.set()
 
-def _run_depth_ordered_spatialiser(cfg, stop_evt: threading.Event):
-    """
-    Listen for classified object coordinates (x, y, depth) and spatialise
-    their associated sounds using the SOFA BRIR. Objects within a scene are
-    played from nearest to farthest.
-    """
-
-    sofa_path = deep_get(cfg, "sonification.sofa", "./sofa-lib/BRIR_HATS_3degree_for_glasses.sofa")
-    image_width = float(deep_get(cfg, "realsense.color_w", 640))
-    osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
-    bt_connect_timeout_s = deep_get(cfg, "audio.bt_connect_timeout_s", 20.0)
-
-    output_blocksize = deep_get(cfg, "audio.output_blocksize")
-    output_latency_s = deep_get(cfg, "audio.output_latency_s")
-    if output_blocksize is not None:
-        try:
-            output_blocksize = int(output_blocksize)
-        except (TypeError, ValueError):
-            output_blocksize = None
-    if output_latency_s is not None:
-        try:
-            output_latency_s = float(output_latency_s)
-        except (TypeError, ValueError):
-            output_latency_s = None
-
-    app = DepthAwareSpatialSound(
-        sofa_file_path=sofa_path,
-        image_width=image_width,
-        osc_port=osc_port,
-        verbose=True,
-        bt_mac=str(deep_get(cfg, "audio.bt_mac", "")) or None,
-        bt_pair=bool(deep_get(cfg, "audio.pair", False)),
-        bt_trust=bool(deep_get(cfg, "audio.trust", True)),
-        bt_connect_timeout_s=float(bt_connect_timeout_s),
-        output_blocksize=output_blocksize,
-        output_latency_s=output_latency_s,
-    )
-
-    thread = threading.Thread(target=app.start, daemon=True)
-    thread.start()
-
-    try:
-        while not stop_evt.is_set():
-            time.sleep(0.2)
-    finally:
-        try:
-            app.OSCserver.server_close()
-        except Exception:
-            pass
-
 def _run_audio_bt_receiver(cfg, stop_evt: threading.Event):
     # Streaming mode (long-term)
     if bool(deep_get(cfg, "audio.stream.enabled", False)):
@@ -190,16 +138,14 @@ def main():
     signal.signal(signal.SIGTERM, _sig_handler)
 
     threads = [
-        threading.Thread(target=_run_depth_ordered_spatialiser, args=(cfg, stop_evt), daemon=True),
         threading.Thread(target=_run_ppg_stream, args=(cfg, stop_evt), daemon=True),
         threading.Thread(target=_run_rs_sender, args=(cfg, stop_evt), daemon=True),
-        # threading.Thread(target=_run_audio_bt_receiver, args=(cfg, stop_evt), daemon=True),
     ]
 
     for t in threads:
         t.start()
 
-    print("[PI] Running (config-driven): RS->UDP + PPG->TCP + Audio<-UDP->BT")
+    print("[PI] Running (config-driven): RS->UDP + PPG->TCP (audio handled on PC)")
     try:
         while not stop_evt.is_set():
             time.sleep(0.5)
