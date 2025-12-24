@@ -34,6 +34,7 @@ import yaml
 import soundfile as sf
 from scipy import signal
 from ultralytics import YOLO
+from pythonosc import udp_client
 
 # ---------------- REQUIRED PROJECT IMPORTS ----------------
 
@@ -295,6 +296,8 @@ class YoloSofaSonifier:
         spatialiser: SofaSpatialiser,
         pcm_stream: Optional[object] = None,
         pcm_params: Optional[object] = None,
+        osc_client: Optional[udp_client.SimpleUDPClient] = None,
+        osc_path: str = "/pcm",
     ):
         self.cfg = cfg
         self.model = YOLO(deep_get(cfg, "yolo.model"))
@@ -306,6 +309,8 @@ class YoloSofaSonifier:
         # Long-term streaming path (preferred)
         self.pcm_stream = pcm_stream
         self.pcm_params = pcm_params
+        self.osc_client = osc_client
+        self.osc_path = osc_path
 
         self.sound_map = deep_get(cfg, "sonification.sound_map", {})
         self.default_sound = deep_get(cfg, "sonification.default_sound")
