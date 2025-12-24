@@ -475,7 +475,8 @@ class SpatialSoundHeadphoneYOLO:
                         self._log_output_rms(audio_to_play)
                         self.playing = True
                         self.enqueue_audio(audio_to_play)
-                        self.enqueue_gap()
+                        if self.current_scene_index + 1 < len(self.current_scene_objects):
+                            self.enqueue_gap()
                         self.playing = False
                         self.last_play_time[cid] = time.time()
                     else:
@@ -802,7 +803,8 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
                         if audio_to_play is not None:
                             self._log_output_rms(audio_to_play)
                             self.enqueue_audio(audio_to_play)
-                            self.enqueue_gap()
+                            if self.current_scene_index + 1 < len(self.current_scene_objects):
+                                self.enqueue_gap()
                             self.playing = False
                             self.last_play_time[cid] = time.time()
                         else:

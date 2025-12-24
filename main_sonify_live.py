@@ -6,6 +6,7 @@ import pickle
 import threading
 import time
 from collections import deque
+from queue import Empty, Full, Queue
 
 import numpy as np
 import cv2
@@ -100,15 +101,17 @@ class RealSenseYOLOFromTCP:
         osc_port: int,
         conf_threshold: float = 0.3,
         show_debug: bool = False,
+        max_det:int=10,
     ):
         self.listen_ip = listen_ip
         self.port = int(port)
         self.conf_threshold = float(conf_threshold)
         self.show_debug = bool(show_debug)
 
-        self.model = YOLO(model_path)
+        self.model = YOLO(model_path).to('cuda')
         self.cls_names = self.model.names
         self.osc_client = SimpleUDPClient(osc_ip, int(osc_port))
+        self.max_det = max_det
 
         # Stability gating (same intent as yolo_realsense.py)
         self.cid_stability_threshold = 0.2
@@ -121,6 +124,10 @@ class RealSenseYOLOFromTCP:
         self._srv = None
         self._running = False
         self._thread = None
+        self._workers = 2
+        self._queue: Queue = Queue(maxsize=4)
+        self._stop_evt = threading.Event()
+        self._worker_threads: list[threading.Thread] = []
 
         self.on_packet = None  # callback(packet_dict)
 
@@ -193,13 +200,29 @@ class RealSenseYOLOFromTCP:
             if depth_png is not None:
                 depth_u16 = decode_depth_png(depth_png)
 
+            try:
+                self._queue.put_nowait((frame, depth_u16, depth_scale))
+            except Full:
+                try:
+                    _ = self._queue.get_nowait()
+                    self._queue.put_nowait((frame, depth_u16, depth_scale))
+                except Empty:
+                    pass
+
+    def _worker(self):
+        while not self._stop_evt.is_set():
+            try:
+                frame, depth_u16, depth_scale = self._queue.get(timeout=0.5)
+            except Empty:
+                continue            
+
             self.frame_index += 1
             now = time.time()
 
             h, w, _ = frame.shape
 
             # YOLO inference (mirrors yolo_realsense.py structure)
-            results = self.model(frame, verbose=False)
+            results = self.model(frame, verbose=False, max_det=self.max_det)
             result = results[0]
 
             stable_candidates = {}  # cls_id -> best detection
@@ -261,21 +284,35 @@ class RealSenseYOLOFromTCP:
                     print("[RS TCP] ESC pressed, closing viewer window.")
                     self.show_debug = False
                     cv2.destroyAllWindows()
+            self._queue.task_done()
 
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        self._stop_evt.clear()
         self._running = True
         self._thread = threading.Thread(target=self._serve, daemon=True)
         self._thread.start()
 
+        alive = [t for t in self._worker_threads if t.is_alive()]
+        self._worker_threads = alive
+        while len(self._worker_threads) < self._workers:
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._worker_threads.append(t)        
+
     def stop(self):
         self._running = False
+        self._stop_evt.set()
         try:
             if self._srv:
                 self._srv.close()
         except Exception:
             pass
+
+        for t in self._worker_threads:
+            t.join(timeout=1.0)
+        self._worker_threads.clear()
 
 
 # -----------------------------

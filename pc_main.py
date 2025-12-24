@@ -168,10 +168,11 @@ class YoloOSCStreamer:
 
     def __init__(self, cfg: Dict, osc_host: str, osc_port: int):
         self.cfg = cfg
-        self.model = YOLO(deep_get(cfg, "yolo.model"))
+        self.model = YOLO(deep_get(cfg, "yolo.model")).to('cuda')
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
         self.osc = udp_client.SimpleUDPClient(osc_host, int(osc_port))
         self.frame_id = 0
+        self.max_det = int(deep_get(cfg, "yolo.max_det", 10))
 
     def process(self, pkt: Dict):
         rgb = pkt["color"]
@@ -179,7 +180,7 @@ class YoloOSCStreamer:
         depth_scale = pkt.get("depth_scale", 0.001)
 
         h, w = rgb.shape[:2]
-        res = self.model(rgb, verbose=False)[0]
+        res = self.model(rgb, verbose=False, max_det=self.max_det)[0]
 
         if res.boxes is None:
             return
@@ -372,7 +373,7 @@ class SceneAudioWindowMixer:
         pcm_params: Optional[object],
         window_ms: int = 200,
         max_objects: int = 3,
-        repeat_chunk0: int = 4,
+        repeat_chunk0: int = 1,
     ):
         self.spatialiser = spatialiser
         self.audio_sender = audio_sender
@@ -384,6 +385,43 @@ class SceneAudioWindowMixer:
 
         self.events: List[SceneAudioEvent] = []
         self.window_start = time.time()
+
+        # Mix and transmit in the background so rendering one window doesn't
+        # block the detector loop that is accumulating the next window.
+        self._stop_evt = threading.Event()
+        self._mix_queue: Queue[list[SceneAudioEvent]] = Queue(maxsize=2)
+        self._worker = threading.Thread(target=self._mix_worker, daemon=True)
+        self._worker.start()
+
+    def _mix_worker(self):
+        while not self._stop_evt.is_set():
+            try:
+                events = self._mix_queue.get(timeout=0.5)
+            except Empty:
+                continue
+
+            try:
+                wav_bytes = self._mix_events(events)
+                if wav_bytes:
+                    self._send_audio(wav_bytes)
+            finally:
+                self._mix_queue.task_done()
+
+    def _enqueue_mix(self, events: list[SceneAudioEvent]):
+        try:
+            self._mix_queue.put_nowait(events)
+        except Full:
+            # Drop the oldest in-flight mix so the latest scene can be rendered
+            # while the previous one plays.
+            try:
+                _ = self._mix_queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                self._mix_queue.put_nowait(events)
+            except Full:
+                # If another thread raced us, just drop this window.
+                pass    
 
     def add_event(self, event: SceneAudioEvent):
         self.events.append(event)
@@ -432,21 +470,7 @@ class SceneAudioWindowMixer:
         sf.write(buf, stereo_mix, int(sr_out), format="WAV", subtype="PCM_16")
         return buf.getvalue()
 
-    def maybe_flush(self, now: Optional[float] = None):
-        now = time.time() if now is None else now
-        if (now - self.window_start) * 1000.0 < self.window_ms:
-            return
-        self.flush(now)
-
-    def flush(self, now: Optional[float] = None):
-        now = time.time() if now is None else now
-        wav_bytes = self._mix_events(self.events)
-        self.events = []
-        self.window_start = now
-
-        if wav_bytes is None:
-            return
-
+    def _send_audio(self, wav_bytes: bytes):
         # Prefer continuous PCM streaming when available
         if self.pcm_stream is not None and self.pcm_params is not None:
             frame_bytes = int(getattr(self.pcm_params, "frame_bytes"))
@@ -458,6 +482,33 @@ class SceneAudioWindowMixer:
                 wav_bytes,
                 repeat_chunk0=self.repeat_chunk0,
             )
+
+    def maybe_flush(self, now: Optional[float] = None):
+        now = time.time() if now is None else now
+        if (now - self.window_start) * 1000.0 < self.window_ms:
+            return
+        self.flush(now)
+
+    def flush(self, now: Optional[float] = None):
+        now = time.time() if now is None else now
+        events = list(self.events)
+        self.events = []
+        self.window_start = now
+        if events:
+            self._enqueue_mix(events)
+
+    def stop(self):
+        self._stop_evt.set()
+        try:
+            while not self._mix_queue.empty():
+                try:
+                    _ = self._mix_queue.get_nowait()
+                    self._mix_queue.task_done()
+                except Empty:
+                    break
+        except Exception:
+            pass
+        self._worker.join(timeout=1.0)
 
 
 
@@ -473,8 +524,9 @@ class YoloSofaSonifier:
         pcm_params: Optional[object] = None,
     ):
         self.cfg = cfg
-        self.model = YOLO(deep_get(cfg, "yolo.model"))
+        self.model = YOLO(deep_get(cfg, "yolo.model")).to('cuda')
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
+        self.max_det = int(deep_get(cfg, 'yolo.max_det', 10))
 
         self.audio_sender = audio_sender
         self.spatialiser = spatialiser
@@ -507,7 +559,7 @@ class YoloSofaSonifier:
         depth_scale = pkt.get("depth_scale", 0.001)
 
         h, w = rgb.shape[:2]
-        res = self.model(rgb, verbose=False)[0]
+        res = self.model(rgb, verbose=False, max_det=self.max_det)[0]
 
         if res.boxes is None:
             self.scene_mixer.maybe_flush(time.time())

@@ -29,6 +29,7 @@ import argparse
 import threading
 import time
 from typing import Dict, Optional
+from queue import Empty, Full, Queue
 from pythonosc import udp_client
 from ultralytics import YOLO
 
@@ -39,14 +40,26 @@ from rs_d455_raw_udp_receiver import RealSenseRawUDPReceiver
 class YoloDepthOSCStreamer:
     def __init__(self, cfg: Dict):
         self.cfg = cfg
-        self.model = YOLO(deep_get(cfg, "yolo.model"))
+        self.model = YOLO(deep_get(cfg, "yolo.model")).to('cuda')
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
+        self.max_det = int(deep_get(cfg, 'yolo.max_det', 10))
+        self._workers = max(1, int(deep_get(cfg, "yolo.workers", 2)))
+        self._queue = Queue(maxsize=int(deep_get(cfg, "yolo.queue_size", 3)))
+        self._stop_evt = threading.Event()
+        self._frame_lock = threading.Lock()
 
         target_ip = str(deep_get(cfg, "network.pi_ip", "127.0.0.1"))
         target_port = int(deep_get(cfg, "ports.audio_udp", 40100))
         self.osc_client = udp_client.SimpleUDPClient(target_ip, target_port)
 
         self.frame_index = 0
+
+        self._threads = [
+            threading.Thread(target=self._worker, daemon=True)
+            for _ in range(self._workers)
+        ]
+        for t in self._threads:
+            t.start()        
 
     def on_frame(self, pkt: Dict):
         color = pkt.get("color")
@@ -56,39 +69,65 @@ class YoloDepthOSCStreamer:
         if color is None:
             return
 
-        h, w = color.shape[:2]
-        res = self.model(color, verbose=False)[0]
+        try:
+            self._queue.put_nowait((color, depth, depth_scale))
+        except Full:
+            try:
+                _ = self._queue.get_nowait()
+                self._queue.put_nowait((color, depth, depth_scale))
+            except Empty:
+                pass
 
-        if res.boxes is None:
+    def _next_frame_index(self) -> int:
+        with self._frame_lock:
+            idx = self.frame_index        
             self.frame_index += 1
-            return
+            return idx
 
-        for box in res.boxes:
-            conf = float(box.conf[0])
-            if conf < self.conf:
+    def _worker(self):
+        while not self._stop_evt.is_set():
+            try:
+                color, depth, depth_scale = self._queue.get(timeout=0.5)
+            except Empty:
                 continue
 
-            label = self.model.names[int(box.cls[0])]
-            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
-            cx = (x1 + x2) * 0.5
-            cy = (y1 + y2) * 0.5
+            h, w = color.shape[:2]
+            res = self.model(color, verbose=False, max_det=10)[0]
 
-            x_norm = max(0.0, min(1.0, cx / w))
-            y_norm = max(0.0, min(1.0, cy / h))
+            frame_idx = self._next_frame_index()
 
-            depth_m: Optional[float] = None
-            if depth is not None:
-                dh, dw = depth.shape[:2]
-                cx_d = int(max(0, min(dw - 1, cx * dw / w)))
-                cy_d = int(max(0, min(dh - 1, cy * dh / h)))
-                d_raw = float(depth[cy_d, cx_d])
-                if d_raw > 0:
-                    depth_m = d_raw * depth_scale
+            if res.boxes is not None:
+                for box in res.boxes:
+                    conf = float(box.conf[0])
+                    if conf < self.conf:
+                        continue
 
-            msg = [float(x_norm), label, float(y_norm), depth_m, int(self.frame_index)]
-            self.osc_client.send_message("/yolo", msg)
+                    label = self.model.names[int(box.cls[0])]
+                    x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+                    cx = (x1 + x2) * 0.5
+                    cy = (y1 + y2) * 0.5
 
-        self.frame_index += 1
+                    x_norm = max(0.0, min(1.0, cx / w))
+                    y_norm = max(0.0, min(1.0, cy / h))                    
+
+                    depth_m: Optional[float] = None
+                    if depth is not None:
+                        dh, dw = depth.shape[:2]
+                        cx_d = int(max(0, min(dw - 1, cx * dw / w)))
+                        cy_d = int(max(0, min(dh - 1, cy * dh / h)))
+                        d_raw = float(depth[cy_d, cx_d])
+                        if d_raw > 0:
+                            depth_m = d_raw * depth_scale
+
+                    msg = [float(x_norm), label, float(y_norm), depth_m, int(frame_idx)]
+                    self.osc_client.send_message("/yolo", msg)
+
+            self._queue.task_done()
+
+    def stop(self):
+        self._stop_evt.set()
+        for t in self._threads:
+            t.join(timeout=1.0)
 
 
 class App:
@@ -136,6 +175,10 @@ class App:
 
     def stop(self):
         self.stop_evt.set()
+        try:
+            self.streamer.stop()
+        except Exception:
+            pass        
         if self._thread is not None:
             self._thread.join(timeout=1.0)
 
