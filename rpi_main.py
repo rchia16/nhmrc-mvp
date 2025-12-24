@@ -91,7 +91,9 @@ def _run_depth_ordered_spatialiser(cfg, stop_evt: threading.Event):
     image_width = float(deep_get(cfg, "realsense.color_w", 640))
     osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
 
-    app = DepthAwareSpatialSound(sofa_file_path=sofa_path, image_width=image_width, osc_port=osc_port)
+    app = DepthAwareSpatialSound(sofa_file_path=sofa_path,
+                                 image_width=image_width, osc_port=osc_port,
+                                 verbose=True)
 
     thread = threading.Thread(target=app.start, daemon=True)
     thread.start()
