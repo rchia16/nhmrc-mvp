@@ -70,6 +70,7 @@ yolo:
 sonification:
   default_sound: "./sound-lib/ui_sci-fi-sound-36061.wav"
   sofa: "./sofa-lib/BRIR_HATS_3degree_for_glasses.sofa"
+  enable_pc_sonifier: false
   out_sr: 16000
   clip_s: 0.35
   fade_ms: 8.0

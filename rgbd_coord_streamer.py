@@ -86,6 +86,7 @@ class YoloDepthOSCStreamer:
                     depth_m = d_raw * depth_scale
 
             msg = [float(x_norm), label, float(y_norm), depth_m, int(self.frame_index)]
+            print("[x, lbl, y, depth, frame]: ", msg)
             self.osc_client.send_message("/yolo", msg)
 
         self.frame_index += 1

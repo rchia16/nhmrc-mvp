@@ -634,9 +634,14 @@ def main():
             f"frame_ms={getattr(pcm_params,'frame_ms')} frame_bytes={getattr(pcm_params,'frame_bytes')}"
         )
 
-    sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
-                                pcm_stream=pcm_stream,
-                                pcm_params=pcm_params)
+    enable_pc_sofa = bool(deep_get(cfg, "sonification.enable_pc_sonifier", True))
+    sonifier: Optional[YoloSofaSonifier] = None
+    if enable_pc_sofa:
+        sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
+                                    pcm_stream=pcm_stream,
+                                    pcm_params=pcm_params)
+    else:
+        print("[PC][SOFA] PC-side SOFA processing disabled; relying on Pi")
 
     print("[PC] Running: RS → YOLO → UDP → Pi → SOFA")
 
@@ -649,7 +654,7 @@ def main():
         rs_rx.start()
         while True:
             pkt = rs_rx.get_latest()
-            if pkt:
+            if enable_pc_sofa and pkt and sonifier is not None:
                 sonifier.process(pkt)
             time.sleep(1.0 / float(deep_get(cfg, "yolo.yolo_hz", 10)))
     except KeyboardInterrupt:
