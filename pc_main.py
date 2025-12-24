@@ -8,9 +8,8 @@ PC-side orchestrator (library-aligned):
     RealSenseRawUDPReceiver (from rs_d455_raw_udp_receiver.py)
 - Receives PPG via TCP using ppg_receive.py
 - Runs YOLO on RGB frames
-- Performs SOFA BRIR spatialisation using yolo_sofa.py
-- Sends spatialised WAV bytes to Raspberry Pi via UDP
-  using bth_audio_manager.py protocol
+- Streams detections via OSC to a local SOFA/BT spatialiser
+  (DepthAwareSpatialSound), keeping all spatialisation on the PC
 
 Run:
   python pc_main.py --config nhmrc_streaming_config.yaml
@@ -33,12 +32,13 @@ import yaml
 import soundfile as sf
 from scipy import signal
 from ultralytics import YOLO
+from pythonosc import udp_client
 
 # ---------------- REQUIRED PROJECT IMPORTS ----------------
 
 from ppg_receive import TCPServerReceiver
 import bth_audio_manager as bam
-from yolo_sofa import SpatialSoundHeadphoneYOLO
+from yolo_sofa import SpatialSoundHeadphoneYOLO, DepthAwareSpatialSound
 from config import deep_get, load_config
 
 # import updated receiver library
@@ -48,13 +48,6 @@ from rs_d455_raw_udp_receiver import (
 )
 
 from rgbd_coord_streamer import App as VisAudioStreamer
-
-# Optional long-term PCM streaming (requires udp_pcm_stream.py in your project)
-try:
-    from udp_pcm_stream import PCMStreamUDPSender, PCMStreamParams
-except Exception:
-    PCMStreamUDPSender = None  # type: ignore
-    PCMStreamParams = None  # type: ignore
 
 
 # ---------------- PPG RECEIVER ----------------
@@ -170,6 +163,55 @@ def wav_bytes_to_pcm16_frames(wav_bytes: bytes, frame_bytes: int):
 
 
 # ---------------- SOFA SPATIALISER ----------------
+class YoloOSCStreamer:
+    """Send YOLO detections to a local OSC spatialiser on the PC."""
+
+    def __init__(self, cfg: Dict, osc_host: str, osc_port: int):
+        self.cfg = cfg
+        self.model = YOLO(deep_get(cfg, "yolo.model"))
+        self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
+        self.osc = udp_client.SimpleUDPClient(osc_host, int(osc_port))
+        self.frame_id = 0
+
+    def process(self, pkt: Dict):
+        rgb = pkt["color"]
+        depth = pkt.get("depth")
+        depth_scale = pkt.get("depth_scale", 0.001)
+
+        h, w = rgb.shape[:2]
+        res = self.model(rgb, verbose=False)[0]
+
+        if res.boxes is None:
+            return
+
+        frame_id = self.frame_id
+        self.frame_id += 1
+
+        for box in res.boxes:
+            conf = float(box.conf[0])
+            if conf < self.conf:
+                continue
+
+            label = self.model.names[int(box.cls[0])]
+
+            x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
+            cx_rgb = int((x1 + x2) / 2)
+            cy_rgb = int((y1 + y2) / 2)
+            y_norm = cy_rgb / float(max(1.0, h))
+
+            r = 1.0
+            if depth is not None:
+                dh, dw = depth.shape[:2]
+                cx_d = int(cx_rgb * dw / w)
+                cy_d = int(cy_rgb * dh / h)
+                cx_d = max(0, min(dw - 1, cx_d))
+                cy_d = max(0, min(dh - 1, cy_d))
+                d = depth[cy_d, cx_d]
+                if d > 0:
+                    r = float(d) * depth_scale
+
+            self.osc.send_message("/yolo", [cx_rgb, label, y_norm, r, frame_id])
+
 
 class SofaSpatialiser:
     """
@@ -540,6 +582,52 @@ class YoloSofaSonifier:
 
 
 # ---------------- MAIN ----------------
+def _run_pc_spatialiser(cfg: Dict, stop_evt: threading.Event):
+    """Run the OSC-driven SOFA spatialiser on the PC (with BT output)."""
+
+    sofa_path = deep_get(cfg, "sonification.sofa", "./sofa-lib/BRIR_HATS_3degree_for_glasses.sofa")
+    image_width = float(deep_get(cfg, "realsense.color_w", 640))
+    osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
+    bt_connect_timeout_s = deep_get(cfg, "audio.bt_connect_timeout_s", 20.0)
+
+    output_blocksize = deep_get(cfg, "audio.output_blocksize")
+    output_latency_s = deep_get(cfg, "audio.output_latency_s")
+    if output_blocksize is not None:
+        try:
+            output_blocksize = int(output_blocksize)
+        except (TypeError, ValueError):
+            output_blocksize = None
+    if output_latency_s is not None:
+        try:
+            output_latency_s = float(output_latency_s)
+        except (TypeError, ValueError):
+            output_latency_s = None
+
+    app = DepthAwareSpatialSound(
+        sofa_file_path=sofa_path,
+        image_width=image_width,
+        osc_port=osc_port,
+        verbose=True,
+        bt_mac=str(deep_get(cfg, "audio.bt_mac", "")) or None,
+        bt_pair=bool(deep_get(cfg, "audio.pair", False)),
+        bt_trust=bool(deep_get(cfg, "audio.trust", True)),
+        bt_connect_timeout_s=float(bt_connect_timeout_s),
+        output_blocksize=output_blocksize,
+        output_latency_s=output_latency_s,
+    )
+
+    thread = threading.Thread(target=app.start, daemon=True)
+    thread.start()
+
+    try:
+        while not stop_evt.is_set():
+            time.sleep(0.2)
+    finally:
+        try:
+            app.OSCserver.server_close()
+        except Exception:
+            pass
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -564,86 +652,20 @@ def main():
     )
     ppg_rx.start()
 
-    # ---------- Audio ----------
-    audio_sender = UDPAudioBytesSender(
-        target_ip=deep_get(cfg, "network.pi_ip"),
-        target_port=int(deep_get(cfg, "ports.audio_udp")),
-        chunk_payload_bytes=int(deep_get(cfg, "audio.send_chunk_bytes", 1200)),
-        # pacing (strongly recommended for big SOFA WAVs)
-        inter_packet_sleep_s=float(deep_get(cfg, "audio.send_inter_packet_sleep_s", 0.0)),
-        # new: avoid receiver overload
-        per_key_ms=int(deep_get(cfg, "audio.per_key_ms", 400)),
-        global_ms=int(deep_get(cfg, "audio.global_ms", 120)),
-        # if you applied the bth_audio_manager diff, these will be honored:
-        sndbuf_bytes=int(deep_get(cfg, "audio.send_sndbuf_bytes", 8 << 20)),
-        min_inter_file_gap_s=float(deep_get(cfg, "audio.min_inter_file_gap_s", 0.15)),
+    # ---------- Audio / OSC spatialisation on PC ----------
+    stop_evt = threading.Event()
+    spatial_thread = threading.Thread(
+        target=_run_pc_spatialiser,
+        args=(cfg, stop_evt),
+        daemon=True,
     )
+    spatial_thread.start()    
 
-    spatialiser = SofaSpatialiser(
-        sofa_path=deep_get(cfg, "sonification.sofa"),
-        image_width=float(deep_get(cfg, "realsense.color_w", 640)),
-        # Smaller SOFA output to survive UDP:
-        out_sr=int(deep_get(cfg, "sonification.out_sr", 16000)),
-        clip_s=float(deep_get(cfg, "sonification.clip_s", 0.35)),
-        fade_ms=float(deep_get(cfg, "sonification.fade_ms", 8.0)),
-        max_peak=float(deep_get(cfg, "sonification.max_peak", 0.95)),
-    )
+    osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
+    sonifier: Optional[YoloOSCStreamer] = None
+    sonifier = YoloOSCStreamer(cfg, "127.0.0.1", osc_port)    
 
-    # sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser)
-    # ---------- PCM streaming (long-term recommended) ----------
-    pcm_stream = None
-    pcm_params = None
-    if bool(deep_get(cfg, "audio.stream.enabled", False)):
-        if PCMStreamUDPSender is None or PCMStreamParams is None:
-            raise RuntimeError(
-                "audio.stream.enabled is true, but udp_pcm_stream.py could not be imported."
-            )
-
-        pcm_params = PCMStreamParams(
-            sample_rate=int(
-                deep_get(
-                    cfg, "audio.stream.sample_rate",
-                    deep_get(cfg, "sonification.out_sr", 16000)
-                )
-            ),
-            channels=int(deep_get(cfg, "audio.stream.channels", 2)),
-            frame_ms=int(deep_get(cfg, "audio.stream.frame_ms", 20)),
-            mtu_payload=int(deep_get(cfg, "audio.stream.mtu_payload", 1400)),
-        )
-
-        # Safety: ensure one frame fits in one UDP payload (this design expects that)
-        if int(getattr(pcm_params, "frame_bytes")) > \
-           int(deep_get(cfg, "audio.stream.mtu_payload", 1400)):
-            raise ValueError(
-                f"PCM frame_bytes={getattr(pcm_params,'frame_bytes')} exceeds "
-                f"mtu_payload={deep_get(cfg,'audio.stream.mtu_payload',1400)}. "
-                f"Reduce audio.stream.frame_ms or increase audio.stream.mtu_payload."
-            )
-
-        pcm_stream = PCMStreamUDPSender(
-            host=str(deep_get(cfg, "network.pi_ip")),
-            port=int(deep_get(cfg, "audio.stream.port", 50030)),
-            params=pcm_params,
-            sndbuf_bytes=int(deep_get(
-                cfg, "audio.stream.sndbuf_bytes", 8 * 1024 * 1024)
-            ),
-        )
-        print(
-            f"[PCM][TX] enabled -> {deep_get(cfg,'network.pi_ip')}:{deep_get(cfg,'audio.stream.port',50030)} "
-            f"sr={getattr(pcm_params,'sample_rate')} ch={getattr(pcm_params,'channels')} "
-            f"frame_ms={getattr(pcm_params,'frame_ms')} frame_bytes={getattr(pcm_params,'frame_bytes')}"
-        )
-
-    enable_pc_sofa = bool(deep_get(cfg, "sonification.enable_pc_sonifier", True))
-    sonifier: Optional[YoloSofaSonifier] = None
-    if enable_pc_sofa:
-        sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
-                                    pcm_stream=pcm_stream,
-                                    pcm_params=pcm_params)
-    else:
-        print("[PC][SOFA] PC-side SOFA processing disabled; relying on Pi")
-
-    print("[PC] Running: RS → YOLO → UDP → Pi → SOFA")
+    print("[PC] Running: RS → YOLO → OSC → BT (local)")
 
     av_stream = VisAudioStreamer(cfg, rs_rx=rs_rx)
 
@@ -654,20 +676,16 @@ def main():
         rs_rx.start()
         while True:
             pkt = rs_rx.get_latest()
-            if enable_pc_sofa and pkt and sonifier is not None:
+            if pkt and sonifier is not None:
                 sonifier.process(pkt)
             time.sleep(1.0 / float(deep_get(cfg, "yolo.yolo_hz", 10)))
     except KeyboardInterrupt:
         print("\n[PC] Shutdown")
     finally:
+        stop_evt.set()
         av_stream.stop()
         rs_rx.stop()
         ppg_rx.stop()
-        if pcm_stream is not None:
-            try:
-                pcm_stream.close()
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":
