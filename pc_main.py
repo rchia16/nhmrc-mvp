@@ -173,6 +173,8 @@ class YoloOSCStreamer:
         self.osc = udp_client.SimpleUDPClient(osc_host, int(osc_port))
         self.frame_id = 0
         self.max_det = int(deep_get(cfg, "yolo.max_det", 10))
+        self._timing_samples = []
+        self._timing_report_every = 10  # frames
 
     def process(self, pkt: Dict):
         rgb = pkt["color"]
@@ -180,9 +182,14 @@ class YoloOSCStreamer:
         depth_scale = pkt.get("depth_scale", 0.001)
 
         h, w = rgb.shape[:2]
+        t0 = time.perf_counter()
         res = self.model(rgb, verbose=False, max_det=self.max_det)[0]
+        t1 = time.perf_counter()
 
-        if res.boxes is None:
+        # If YOLO returns nothing (e.g., empty frame), still account for the
+        # inference time so the periodic profiler can emit a line.
+        if res.boxes is None or len(res.boxes) == 0:
+            self._record_timing(t1 - t0, 0.0)
             return
 
         frame_id = self.frame_id
@@ -212,6 +219,24 @@ class YoloOSCStreamer:
                     r = float(d) * depth_scale
 
             self.osc.send_message("/yolo", [cx_rgb, label, y_norm, r, frame_id])
+
+        # Basic profiling so we can pinpoint OSC slowdown sources.
+        # Model inference dominates when OSC streams feel sluggish.
+        t2 = time.perf_counter()
+        self._record_timing(t1-t0, t2-t1)
+
+    def _record_timing(self, inference_s:float, osc_s:float):
+        """Collect and periodically print YOLO→OSC timing averages."""
+        self._timing_samples.append((inference_s, osc_s))
+        if len(self._timing_samples) >= self._timing_report_every:
+            inf_avg = sum(s[0] for s in self._timing_samples) / len(self._timing_samples)
+            osc_avg = sum(s[1] for s in self._timing_samples) / len(self._timing_samples)
+            print(
+                f"[YOLO→OSC] avg inference={inf_avg*1000:.1f} ms, "
+                f"avg osc/packaging={osc_avg*1000:.1f} ms over {len(self._timing_samples)} frames"
+            )
+            self._timing_samples.clear()
+
 
 
 class SofaSpatialiser:
@@ -719,12 +744,12 @@ def main():
 
     print("[PC] Running: RS → YOLO → OSC → BT (local)")
 
-    av_stream = VisAudioStreamer(cfg, rs_rx=rs_rx)
+    # av_stream = VisAudioStreamer(cfg, rs_rx=rs_rx)
 
     try:
         # Run the RGB-D visual/audio streamer in the background (shares the
         # same UDP socket)
-        av_stream.start(background=True)
+        # av_stream.start(background=True)
         rs_rx.start()
         while True:
             pkt = rs_rx.get_latest()
@@ -735,7 +760,7 @@ def main():
         print("\n[PC] Shutdown")
     finally:
         stop_evt.set()
-        av_stream.stop()
+        # av_stream.stop()
         rs_rx.stop()
         ppg_rx.stop()
 
