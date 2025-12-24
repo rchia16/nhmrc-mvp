@@ -49,7 +49,7 @@ audio:
     max_objects: 1
   # long-term streaming mode
   stream:
-    enabled: true
+    enabled: false
     port: 50030
     sample_rate: 16000
     channels: 2

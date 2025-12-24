@@ -635,11 +635,11 @@ def main():
             f"frame_ms={getattr(pcm_params,'frame_ms')} frame_bytes={getattr(pcm_params,'frame_bytes')}"
         )
 
-    sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
-                                pcm_stream=pcm_stream,
-                                pcm_params=pcm_params)
+        sonifier = YoloSofaSonifier(cfg, audio_sender, spatialiser,
+                                    pcm_stream=pcm_stream,
+                                    pcm_params=pcm_params)
 
-    print("[PC] Running: RS → YOLO → SOFA → UDP → Pi")
+    print("[PC] Running: RS → YOLO → UDP → Pi → SOFA")
 
     av_stream = VisAudioStreamer(cfg)
 
