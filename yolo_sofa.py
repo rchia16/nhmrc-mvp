@@ -534,6 +534,7 @@ class SpatialSoundHeadphoneYOLO:
 
         return signal_this
 
+
 class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
     def __init__(self, osc_port: int = 6969, elevation_range_deg: float = 90.0, **kwargs):
         self.osc_port = int(osc_port)
