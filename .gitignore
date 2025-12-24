@@ -3,6 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Vim
+*.swp
+*.un~
+
+# Weights
+*.pt
+
 # C extensions
 *.so
 
@@ -16,6 +23,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+log/
+logs/
 parts/
 sdist/
 var/
