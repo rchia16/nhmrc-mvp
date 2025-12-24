@@ -698,7 +698,7 @@ def _run_pc_spatialiser(cfg: Dict, stop_evt: threading.Event):
 
     try:
         while not stop_evt.is_set():
-            time.sleep(0.2)
+            time.sleep(0.1)
     finally:
         try:
             app.OSCserver.server_close()
@@ -739,11 +739,15 @@ def main():
     spatial_thread.start()    
 
     osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
-    sonifier: Optional[YoloOSCStreamer] = None
+    # sonifier: Optional[YoloOSCStreamer] = None
     sonifier = YoloOSCStreamer(cfg, "127.0.0.1", osc_port)    
 
     print("[PC] Running: RS → YOLO → OSC → BT (local)")
 
+    def process_frame(pkt: Dict):
+        """Process the newest frame inline: YOLO → spatialisation."""
+        if pkt and sonifier is not None:
+            sonifier.process(pkt)
     # av_stream = VisAudioStreamer(cfg, rs_rx=rs_rx)
 
     try:
@@ -755,7 +759,11 @@ def main():
             pkt = rs_rx.get_latest()
             if pkt and sonifier is not None:
                 sonifier.process(pkt)
+                # process_frame(pkt)
             time.sleep(1.0 / float(deep_get(cfg, "yolo.yolo_hz", 10)))
+        # Process frames synchronously as they arrive from the UDP stream.
+        # rs_rx.on_frame = process_frame
+        # rs_rx.run_forever()
     except KeyboardInterrupt:
         print("\n[PC] Shutdown")
     finally:
