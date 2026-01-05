@@ -200,9 +200,6 @@ class YoloOSCStreamer:
 
         h, w = color_image.shape[:2]
 
-        color_image = np.ascontiguousarray(color_image, dtype=np.uint8)
-        depth_image = np.ascontiguousarray(depth_image, dtype=np.uint8)
-
         t0 = time.perf_counter()
         # res = self.model(color_image, verbose=False, max_det=self.max_det)[0]
         res = self.model.predict(
@@ -253,7 +250,8 @@ class YoloOSCStreamer:
         # Basic profiling so we can pinpoint OSC slowdown sources.
         # Model inference dominates when OSC streams feel sluggish.
         t2 = time.perf_counter()
-        self._record_timing(t1-t0, t2-t1)
+        print("model inference: ", t1 - t0, "osc messages: ", t2-t1)
+        # self._record_timing(t1-t0, t2-t1)
 
     def _record_timing(self, inference_s:float, osc_s:float):
         """Collect and periodically print YOLO→OSC timing averages."""

@@ -45,8 +45,8 @@ audio:
   min_inter_file_gap_s: 0.15
   per_label_cooldown_s: 1.2
   volume: 1.0
-  output_blocksize: 64
-  output_latency_s: 0.1
+  output_blocksize: 2048
+  output_latency_s: 0.15
   scene:
     window_ms: 1000
     max_objects: 1

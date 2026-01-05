@@ -98,6 +98,10 @@ class SpatialSoundHeadphoneYOLO:
         self.output_blocksize = output_blocksize
         self.output_latency_s = output_latency_s
 
+        # Max buffered audio before we drop backlog ("latest wins") to avoid
+        # slow/laggy playback.
+        self.max_buffer_s = 0.5
+
         # Optional per-class cooldown across scenes (can be small or 0.0)
         self.min_interval_between_plays = 0.15
         self.last_play_time = {}  # cid_or_label -> last time played
@@ -210,8 +214,13 @@ class SpatialSoundHeadphoneYOLO:
     # Audio streaming helpers
     # ------------------------------------------------------------------
     def _stream_callback(self, outdata, frames, time_info, status):
+        # Never print every callback on Windows; it can cause/compound underflows.
         if status:
-            print(f"[STREAM] status: {status}")
+            now = time.time()
+            last = getattr(self, "_last_status_print", 0.0)
+            if now - last >= 1.0:
+                print(f"[STREAM] status: {status}")
+                self._last_status_print = now
         outdata.fill(0.0)
         with self._buffer_lock:
             remaining = frames
@@ -240,6 +249,16 @@ class SpatialSoundHeadphoneYOLO:
         self._stream.start()
         self._log_output_device_info(prefix="[AUDIO] Active stream")
 
+    def _buffer_seconds_locked(self) -> float:
+        total_frames = -self._audio_buffer_pos
+        for c in self._audio_buffer:
+            total_frames += c.shape[0]
+        return total_frames / float(self.BRIR_samplerate)
+
+    def _buffer_seconds(self) -> float:
+        with self._buffer_lock:
+            return self._buffer_seconds_locked()
+
     @staticmethod
     def _log_output_rms(audio_to_play: np.ndarray) -> None:
         if audio_to_play is None or audio_to_play.size == 0:
@@ -254,9 +273,25 @@ class SpatialSoundHeadphoneYOLO:
         if audio.ndim == 1:
             audio = np.stack([audio, audio], axis=-1)
         with self._buffer_lock:
+            if self.max_buffer_s and self._buffer_seconds_locked() > self.max_buffer_s:
+                self._audio_buffer.clear()
+                self._audio_buffer_pos = 0
             self._audio_buffer.append(audio)
             n_chunks = len(self._audio_buffer)
-        print(f"[AUDIO] enqueued chunk frames={audio.shape[0]} buffer_chunks={n_chunks}")
+
+        # Throttle debug prints to avoid log-induced jitter.
+        now = time.time()
+        last = getattr(self, "_last_enqueue_print", 0.0)
+        if now - last >= 1.0:
+            try:
+                buf_s = self._buffer_seconds()
+            except Exception:
+                buf_s = -1.0
+            print(
+                f"[AUDIO] enqueued chunk frames={audio.shape[0]} "
+                f"buffer_chunks={n_chunks} buffer_s={buf_s:.2f}"
+            )
+            self._last_enqueue_print = now
 
     def enqueue_gap(self):
         gap_frames = int(self.inter_object_gap_s * self.BRIR_samplerate)
@@ -685,15 +720,6 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
         osc_dispatcher.map("/yolo", self.yolo_handler)
         self.OSCserver = osc_server.ThreadingOSCUDPServer(("0.0.0.0", self.osc_port), osc_dispatcher)
 
-    def _buffer_seconds(self) -> float:
-        with self._buffer_lock:
-            if not self._audio_buffer:
-                return 0.0
-            total_frames = -self._audio_buffer_pos
-            for chunk in self._audio_buffer:
-                total_frames += chunk.shape[0]
-        return total_frames / float(self.BRIR_samplerate)
-
 
     def yolo_handler(self, address, *args):
         """Handle /yolo messages that include x, y, depth, and frame id."""
@@ -824,10 +850,12 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
                             print(f"[SCENE] Playing scene {self.current_scene_id}, object index {self.current_scene_index}, "
                                   f"cid={cid}, depth={obj.get('depth_m', 'n/a')}")
 
-                        # Backpressure: don’t generate more if buffer already “full enough”
-                        if self._buffer_seconds() > 0.5:   # tune 0.2–1.0
+                        # Optional backpressure: let callback drain a little.
+                        # NOTE: enqueue_audio() now enforces a hard cap via 
+                        # max_buffer_s (latest wins).
+                        if self._buffer_seconds() > (self.max_buffer_s or 0.5):
                             time.sleep(0.01)
-                            continue
+
                         audio_to_play = self.prepare_sound_yolo(
                             self.yolo_counter, audio, is_mono=is_mono)
                         self.yolo_counter += 1
