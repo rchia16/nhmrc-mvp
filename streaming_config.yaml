@@ -45,6 +45,8 @@ audio:
   min_inter_file_gap_s: 0.15
   per_label_cooldown_s: 1.2
   volume: 1.0
+  output_blocksize: 64
+  output_latency_s: 0.1
   scene:
     window_ms: 1000
     max_objects: 1
@@ -66,7 +68,7 @@ yolo:
   stable_seconds: 0.20
   forget_seconds: 1.00
   cooldown_seconds: 0.60
-  yolo_hz: 10.0
+  yolo_hz: 5.0
   max_det: 4
 
 sonification:

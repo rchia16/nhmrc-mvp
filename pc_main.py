@@ -33,6 +33,7 @@ import soundfile as sf
 from scipy import signal
 from ultralytics import YOLO
 from pythonosc import udp_client
+import pyrealsense2 as rs
 
 # ---------------- REQUIRED PROJECT IMPORTS ----------------
 
@@ -49,6 +50,7 @@ from rs_d455_raw_udp_receiver import (
 
 from rgbd_coord_streamer import App as VisAudioStreamer
 
+device = 'cuda'
 
 # ---------------- PPG RECEIVER ----------------
 
@@ -168,22 +170,50 @@ class YoloOSCStreamer:
 
     def __init__(self, cfg: Dict, osc_host: str, osc_port: int):
         self.cfg = cfg
-        self.model = YOLO(deep_get(cfg, "yolo.model")).to('cuda')
+        self.model = YOLO(deep_get(cfg, "yolo.model")).to(device)
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
         self.osc = udp_client.SimpleUDPClient(osc_host, int(osc_port))
         self.frame_id = 0
         self.max_det = int(deep_get(cfg, "yolo.max_det", 10))
         self._timing_samples = []
-        self._timing_report_every = 10  # frames
+        self._timing_report_every = 30  # frames
+
+        # Align depth to color
+        self.align = rs.align(rs.stream.color)
 
     def process(self, pkt: Dict):
         rgb = pkt["color"]
         depth = pkt.get("depth")
         depth_scale = pkt.get("depth_scale", 0.001)
 
-        h, w = rgb.shape[:2]
+        # aligned_frames = self.align.process(pkt)
+
+        # depth_frame = aligned_frames.get_depth_frame()
+        # color_frame = aligned_frames.get_color_frame()
+        # if not depth_frame or not color_frame:
+        #     return
+
+        # depth_image = np.asanyarray(depth_frame.get_data())
+        # color_image = np.asanyarray(color_frame.get_data())
+        depth_image = depth
+        color_image = rgb
+
+        h, w = color_image.shape[:2]
+
+        color_image = np.ascontiguousarray(color_image, dtype=np.uint8)
+        depth_image = np.ascontiguousarray(depth_image, dtype=np.uint8)
+
         t0 = time.perf_counter()
-        res = self.model(rgb, verbose=False, max_det=self.max_det)[0]
+        # res = self.model(color_image, verbose=False, max_det=self.max_det)[0]
+        res = self.model.predict(
+            color_image,
+            imgsz=416,
+            conf=0.5,
+            iou=0.5,
+            max_det=self.max_det,
+            device=0,          # or "cpu"
+            verbose=False
+        )[0]
         t1 = time.perf_counter()
 
         # If YOLO returns nothing (e.g., empty frame), still account for the
@@ -208,13 +238,13 @@ class YoloOSCStreamer:
             y_norm = cy_rgb / float(max(1.0, h))
 
             r = 1.0
-            if depth is not None:
-                dh, dw = depth.shape[:2]
+            if depth_image is not None:
+                dh, dw = depth_image.shape[:2]
                 cx_d = int(cx_rgb * dw / w)
                 cy_d = int(cy_rgb * dh / h)
                 cx_d = max(0, min(dw - 1, cx_d))
                 cy_d = max(0, min(dh - 1, cy_d))
-                d = depth[cy_d, cx_d]
+                d = depth_image[cy_d, cx_d]
                 if d > 0:
                     r = float(d) * depth_scale
 
@@ -312,6 +342,7 @@ class SofaSpatialiser:
         Spatialise and return float32 stereo array + sample rate.
         Optional clip_override_s lets callers force a shorter windowed render.
         """
+        t0 = time.time()
         clip_s = self.clip_s if clip_override_s is None else float(clip_override_s)
 
         audio, fs_src = sf.read(mono_path, dtype="float32", always_2d=False)
@@ -360,6 +391,8 @@ class SofaSpatialiser:
         if peak > 0:
             stereo *= min(1.0, self.max_peak / peak)
         stereo = np.clip(stereo, -1.0, 1.0)
+
+        print("----------\n- spatialise array: ", time.time()-t0, "\n---------")
 
         return stereo.astype(np.float32, copy=False), int(self.out_sr)
 
@@ -549,7 +582,7 @@ class YoloSofaSonifier:
         pcm_params: Optional[object] = None,
     ):
         self.cfg = cfg
-        self.model = YOLO(deep_get(cfg, "yolo.model")).to('cuda')
+        self.model = YOLO(deep_get(cfg, "yolo.model")).to(device)
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
         self.max_det = int(deep_get(cfg, 'yolo.max_det', 10))
 
@@ -584,6 +617,8 @@ class YoloSofaSonifier:
         depth_scale = pkt.get("depth_scale", 0.001)
 
         h, w = rgb.shape[:2]
+        print("color: ", pkt['color'].shape)
+        print("depth: ", pkt['depth'].shape)
         res = self.model(rgb, verbose=False, max_det=self.max_det)[0]
 
         if res.boxes is None:
@@ -613,6 +648,9 @@ class YoloSofaSonifier:
             x_norm = cx_rgb / w
             az = -90.0 + 180.0 * x_norm
 
+            # debug timing
+            print("compute bbox and azimuth: ", time.time()-now)
+
             r = 1.0
             if depth is not None:
                 dh, dw = depth.shape[:2]
@@ -628,6 +666,9 @@ class YoloSofaSonifier:
                 d = depth[cy_d, cx_d]
                 if d > 0:
                     r = float(d) * depth_scale
+
+                # debug timing
+                print("compute depth: ", time.time()-now)
 
             # 1) cooldown (existing)
             if now - self.last_play.get(label, 0) < self.per_label_cooldown_s:
@@ -649,8 +690,13 @@ class YoloSofaSonifier:
         for ev in pending_events:
             self.scene_mixer.add_event(ev)
 
+        # debug timing
+        print("adding events: ", time.time()-now)
+
         # Send one clip per window (packetised PCM preferred)
         self.scene_mixer.maybe_flush(time.time())
+        # debug timing
+        print("one clip per window: ", time.time()-now)
 
         if pending_events:
             labels = ", ".join([ev.label for ev in pending_events])
@@ -684,7 +730,7 @@ def _run_pc_spatialiser(cfg: Dict, stop_evt: threading.Event):
         sofa_file_path=sofa_path,
         image_width=image_width,
         osc_port=osc_port,
-        verbose=True,
+        verbose=False,
         bt_mac=str(deep_get(cfg, "audio.bt_mac", "")) or None,
         bt_pair=bool(deep_get(cfg, "audio.pair", False)),
         bt_trust=bool(deep_get(cfg, "audio.trust", True)),
@@ -757,13 +803,14 @@ def main():
         rs_rx.start()
         while True:
             pkt = rs_rx.get_latest()
-            if pkt and sonifier is not None:
-                sonifier.process(pkt)
-                # process_frame(pkt)
+            # if pkt and sonifier is not None:
+            #     sonifier.process(pkt)
+            process_frame(pkt)
+            
             time.sleep(1.0 / float(deep_get(cfg, "yolo.yolo_hz", 10)))
         # Process frames synchronously as they arrive from the UDP stream.
-        # rs_rx.on_frame = process_frame
-        # rs_rx.run_forever()
+        rs_rx.on_frame = process_frame
+        rs_rx.run_forever()
     except KeyboardInterrupt:
         print("\n[PC] Shutdown")
     finally:

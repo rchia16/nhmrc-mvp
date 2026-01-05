@@ -25,6 +25,7 @@ unlock_sound_file = join(sound_lib, 'mixkit-unlock-game-notification-253.wav')
 shortz_sound_file = join(sound_lib, 'Shortzz.mp3')
 scifi_sound_file = join(sound_lib, 'ui_sci-fi-sound-36061.wav')  # default
 
+MAX_OBJECTS_PER_SCENE = 2
 
 class SpatialSoundHeadphoneYOLO:
     """
@@ -98,7 +99,7 @@ class SpatialSoundHeadphoneYOLO:
         self.output_latency_s = output_latency_s
 
         # Optional per-class cooldown across scenes (can be small or 0.0)
-        self.min_interval_between_plays = 0.0
+        self.min_interval_between_plays = 0.15
         self.last_play_time = {}  # cid_or_label -> last time played
 
         # ---- OSC dispatcher ----
@@ -233,6 +234,8 @@ class SpatialSoundHeadphoneYOLO:
             channels=2,
             dtype='float32',
             callback=self._stream_callback,
+            blocksize=self.output_blocksize,
+            latency=self.output_latency_s,
         )
         self._stream.start()
         self._log_output_device_info(prefix="[AUDIO] Active stream")
@@ -252,6 +255,8 @@ class SpatialSoundHeadphoneYOLO:
             audio = np.stack([audio, audio], axis=-1)
         with self._buffer_lock:
             self._audio_buffer.append(audio)
+            n_chunks = len(self._audio_buffer)
+        print(f"[AUDIO] enqueued chunk frames={audio.shape[0]} buffer_chunks={n_chunks}")
 
     def enqueue_gap(self):
         gap_frames = int(self.inter_object_gap_s * self.BRIR_samplerate)
@@ -650,8 +655,15 @@ class SpatialSoundHeadphoneYOLO:
         index_source = np.argmin(distances)
         BRIR_this = BRIRs[index_source, :, :]
 
-        signal_this_left = signal.convolve(10 * audio, BRIR_this[0, :], mode='full')
-        signal_this_right = signal.convolve(10 * audio, BRIR_this[1, :], mode='full')
+        # signal_this_left = signal.convolve(10 * audio, BRIR_this[0, :], mode='full')
+        # signal_this_right = signal.convolve(10 * audio, BRIR_this[1, :], mode='full')
+        a = (10.0 * audio).astype(np.float32, copy=False)
+        hL = BRIR_this[0, :].astype(np.float32, copy=False)
+        hR = BRIR_this[1, :].astype(np.float32, copy=False)
+
+        signal_this_left  = signal.fftconvolve(a, hL, mode='full')
+        signal_this_right = signal.fftconvolve(a, hR, mode='full')
+
         signal_this = np.stack((signal_this_left, signal_this_right), axis=-1)
 
         return signal_this
@@ -672,6 +684,16 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
         osc_dispatcher = dispatcher.Dispatcher()
         osc_dispatcher.map("/yolo", self.yolo_handler)
         self.OSCserver = osc_server.ThreadingOSCUDPServer(("0.0.0.0", self.osc_port), osc_dispatcher)
+
+    def _buffer_seconds(self) -> float:
+        with self._buffer_lock:
+            if not self._audio_buffer:
+                return 0.0
+            total_frames = -self._audio_buffer_pos
+            for chunk in self._audio_buffer:
+                total_frames += chunk.shape[0]
+        return total_frames / float(self.BRIR_samplerate)
+
 
     def yolo_handler(self, address, *args):
         """Handle /yolo messages that include x, y, depth, and frame id."""
@@ -754,7 +776,12 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
                     if not scene_dict:
                         continue
 
-                    items = sorted(scene_dict.items(), key=lambda kv: kv[1].get("depth_m", float("inf")))
+                    items = sorted(
+                        scene_dict.items(),
+                        key=lambda kv: kv[1].get("depth_m", float("inf"))
+                    )
+                    items = items[:MAX_OBJECTS_PER_SCENE]
+
 
                     self.current_scene_id = next_scene_id
                     self.current_scene_objects = items
@@ -797,7 +824,12 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
                             print(f"[SCENE] Playing scene {self.current_scene_id}, object index {self.current_scene_index}, "
                                   f"cid={cid}, depth={obj.get('depth_m', 'n/a')}")
 
-                        audio_to_play = self.prepare_sound_yolo(self.yolo_counter, audio, is_mono=is_mono)
+                        # Backpressure: don’t generate more if buffer already “full enough”
+                        if self._buffer_seconds() > 0.5:   # tune 0.2–1.0
+                            time.sleep(0.01)
+                            continue
+                        audio_to_play = self.prepare_sound_yolo(
+                            self.yolo_counter, audio, is_mono=is_mono)
                         self.yolo_counter += 1
 
                         if audio_to_play is not None:
