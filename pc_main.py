@@ -17,6 +17,7 @@ Run:
 
 from __future__ import annotations
 
+import sys
 import argparse
 import io
 import os
@@ -24,7 +25,8 @@ import time
 import random
 import struct
 import threading
-from typing import Dict, Optional, Tuple
+import subprocess
+from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
 
 import numpy as np
@@ -34,6 +36,7 @@ from scipy import signal
 from ultralytics import YOLO
 from pythonosc import udp_client
 import pyrealsense2 as rs
+import torch
 
 # ---------------- REQUIRED PROJECT IMPORTS ----------------
 
@@ -45,6 +48,7 @@ from config import deep_get, load_config
 # import updated receiver library
 from rs_d455_raw_udp_receiver import (
     RealSenseRawUDPReceiver,
+    RealSenseRawUDPViewer,
     ReceiverStats,
 )
 
@@ -166,14 +170,32 @@ def wav_bytes_to_pcm16_frames(wav_bytes: bytes, frame_bytes: int):
 
 # ---------------- SOFA SPATIALISER ----------------
 class YoloOSCStreamer:
-    """Send YOLO detections to a local OSC spatialiser on the PC."""
+    """
+    Send YOLO detections to a local OSC spatialiser on the PC.
+
+    Updated: "scene-period" batching.
+      - Collect detections for scene_period_ms
+      - At end of scene period, send up to max_objects (default 5),
+        prioritised by closest distance (smallest r).
+      - Keeps receiver compatible by sending standard "/yolo" messages.
+    """
 
     def __init__(self, cfg: Dict, osc_host: str, osc_port: int):
         self.cfg = cfg
         self.model = YOLO(deep_get(cfg, "yolo.model")).to(device)
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
         self.osc = udp_client.SimpleUDPClient(osc_host, int(osc_port))
-        self.frame_id = 0
+        # Scene batching
+        self.scene_period_ms = int(deep_get(cfg, "audio.scene.window_ms", 1200))
+        self.max_objects = int(deep_get(cfg, "audio.scene.max_objects", 3))
+        self._scene_start_t = time.time()
+        self._scene_id = 0
+        self._pending: List[Tuple[float, int, str, float]] = []  # (r, cx_rgb, label, y_norm)
+
+        # Optional keepalive (helps keep pipelines "warm" when no detections)
+        self.keepalive_ms = int(deep_get(cfg, "audio.osc_keepalive_ms", 0))  # 0 disables
+        self._last_keepalive_t = time.time()
+
         self.max_det = int(deep_get(cfg, "yolo.max_det", 10))
         self._timing_samples = []
         self._timing_report_every = 30  # frames
@@ -186,22 +208,26 @@ class YoloOSCStreamer:
         depth = pkt.get("depth")
         depth_scale = pkt.get("depth_scale", 0.001)
 
-        # aligned_frames = self.align.process(pkt)
-
-        # depth_frame = aligned_frames.get_depth_frame()
-        # color_frame = aligned_frames.get_color_frame()
-        # if not depth_frame or not color_frame:
-        #     return
-
-        # depth_image = np.asanyarray(depth_frame.get_data())
-        # color_image = np.asanyarray(color_frame.get_data())
         depth_image = depth
         color_image = rgb
 
         h, w = color_image.shape[:2]
 
         t0 = time.perf_counter()
-        # res = self.model(color_image, verbose=False, max_det=self.max_det)[0]
+        now = time.time()
+
+        # Periodic flush (scene boundary)
+        if (now - self._scene_start_t) * 1000.0 >= self.scene_period_ms:
+            self._flush_scene()
+            self._scene_start_t = now
+
+        # Optional keepalive tick (doesn't play sound by itself unless receiver maps it)
+        if self.keepalive_ms > 0 and (now - self._last_keepalive_t) * 1000.0 >= self.keepalive_ms:
+            # If your receiver ignores this address, it’s harmless.
+            # If you later add a handler, you can use it to keep a quiet bed/noise alive.
+            self.osc.send_message("/keepalive", [int(self._scene_id)])
+            self._last_keepalive_t = now
+
         res = self.model.predict(
             color_image,
             imgsz=416,
@@ -211,6 +237,7 @@ class YoloOSCStreamer:
             device=0,          # or "cpu"
             verbose=False
         )[0]
+        torch.cuda.synchronize()
         t1 = time.perf_counter()
 
         # If YOLO returns nothing (e.g., empty frame), still account for the
@@ -219,8 +246,8 @@ class YoloOSCStreamer:
             self._record_timing(t1 - t0, 0.0)
             return
 
-        frame_id = self.frame_id
-        self.frame_id += 1
+        # frame_id = self.frame_id
+        # self.frame_id += 1
 
         for box in res.boxes:
             conf = float(box.conf[0])
@@ -245,13 +272,47 @@ class YoloOSCStreamer:
                 if d > 0:
                     r = float(d) * depth_scale
 
-            self.osc.send_message("/yolo", [cx_rgb, label, y_norm, r, frame_id])
+            # self.osc.send_message("/yolo", [cx_rgb, label, y_norm, r, frame_id])
+            # Collect for this scene period; receiver will be driven by scene flush.
+            self._pending.append((r, cx_rgb, label, float(y_norm)))
 
         # Basic profiling so we can pinpoint OSC slowdown sources.
         # Model inference dominates when OSC streams feel sluggish.
         t2 = time.perf_counter()
         print("model inference: ", t1 - t0, "osc messages: ", t2-t1)
         # self._record_timing(t1-t0, t2-t1)
+
+
+    def _flush_scene(self):
+        """
+        Send at most max_objects, prioritised by closest (smallest r).
+        Uses "/yolo" address for compatibility.
+        """
+        if not self._pending:
+            # still increment scene id so keepalive has monotonic ids if enabled
+            self._scene_id += 1
+            return
+
+        # Prefer closest objects; also de-duplicate by label to avoid spamming the same class
+        # (optional but usually desirable). Keeps the closest instance of each label.
+        by_label: Dict[str, Tuple[float, int, str, float]] = {}
+        for item in self._pending:
+            r, cx, label, y_norm = item
+            prev = by_label.get(label)
+            if prev is None or r < prev[0]:
+                by_label[label] = item
+
+        candidates = list(by_label.values())
+        candidates.sort(key=lambda t: t[0])  # r ascending (closest first)
+        selected = candidates[: max(1, self.max_objects)]
+
+        scene_id = int(self._scene_id)
+        for (r, cx_rgb, label, y_norm) in selected:
+            # Frame/scene id used as the "frame_id" field expected by your receiver.
+            self.osc.send_message("/yolo", [int(cx_rgb), str(label), float(y_norm), float(r), scene_id])
+
+        self._pending.clear()
+        self._scene_id += 1
 
     def _record_timing(self, inference_s:float, osc_s:float):
         """Collect and periodically print YOLO→OSC timing averages."""
@@ -749,11 +810,37 @@ def _run_pc_spatialiser(cfg: Dict, stop_evt: threading.Event):
         except Exception:
             pass
 
+def run_spatialiser_process(cfg_path: str):
+    """
+    Entry point for the standalone spatialiser process.
+    Keeps the spatialiser in a separate OS process to avoid CPU contention
+    affecting YOLO timing.
+    """
+    cfg = load_config(cfg_path)
+    stop_evt = threading.Event()
+    _run_pc_spatialiser(cfg, stop_evt)
+
 
 def main():
+    '''
+    Spatialiser only for debugging:
+        python pc_main.py --config streaming_config.yaml --run-spatialiser
+    
+    '''
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="./streaming_config.yaml")
+    ap.add_argument(
+        "--run-spatialiser",
+        action="store_true",
+        help="Run only the OSC/BT spatialiser (used when launched as a child process).",
+    )
     args = ap.parse_args()
+
+    # Child-process mode: just run the spatialiser and block forever
+    if args.run_spatialiser:
+        run_spatialiser_process(args.config)
+        return
+
 
     cfg = load_config(args.config)
 
@@ -765,6 +852,12 @@ def main():
         max_inflight=int(deep_get(cfg, "realsense.max_inflight", 8)),
     )
 
+    # ---------- Viewer -----------
+    viewer = RealSenseRawUDPViewer(
+        show_rgb=True,
+        show_depth=True,
+    )
+
     # ---------- PPG ----------
     ppg_rx = PPGReceiverThread(
         listen_ip=deep_get(cfg, "network.pc_listen_ip", "0.0.0.0"),
@@ -773,14 +866,20 @@ def main():
     )
     ppg_rx.start()
 
-    # ---------- Audio / OSC spatialisation on PC ----------
-    stop_evt = threading.Event()
-    spatial_thread = threading.Thread(
-        target=_run_pc_spatialiser,
-        args=(cfg, stop_evt),
-        daemon=True,
-    )
-    spatial_thread.start()    
+    # ---------- Audio / OSC spatialisation on PC (separate process) ----------
+    spatial_proc: Optional[subprocess.Popen] = None
+    try:
+        spatial_proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--config", 
+             args.config, "--run-spatialiser"],
+            stdout=None,
+            stderr=None,
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP \
+                           if os.name == "nt" else 0),
+        )
+    except Exception as e:
+        print(f"[PC] Failed to start spatialiser process: {e}")
+        spatial_proc = None
 
     osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
     # sonifier: Optional[YoloOSCStreamer] = None
@@ -812,10 +911,19 @@ def main():
     except KeyboardInterrupt:
         print("\n[PC] Shutdown")
     finally:
-        stop_evt.set()
         # av_stream.stop()
         rs_rx.stop()
         ppg_rx.stop()
+        if spatial_proc is not None:
+            try:
+                # Graceful terminate first
+                spatial_proc.terminate()
+                spatial_proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    spatial_proc.kill()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
