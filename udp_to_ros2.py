@@ -220,8 +220,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen-ip", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=50010)
-    ap.add_argument("--timeout-ms", type=int, default=200)
-    ap.add_argument("--max-inflight", type=int, default=8)
+    ap.add_argument("--timeout-ms", type=int, default=600)
+    ap.add_argument("--max-inflight", type=int, default=64)
     ap.add_argument("--rcvbuf-bytes", type=int, default=(1 << 22))
 
     ap.add_argument("--publish-hz", type=float, default=120.0, help="ROS publish loop rate (not UDP rate).")
