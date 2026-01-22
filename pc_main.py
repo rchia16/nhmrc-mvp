@@ -54,7 +54,7 @@ from rs_d455_raw_udp_receiver import (
 
 from rgbd_coord_streamer import App as VisAudioStreamer
 
-device = 'cuda'
+device = 'cpu'
 
 # ---------------- PPG RECEIVER ----------------
 
@@ -234,10 +234,11 @@ class YoloOSCStreamer:
             conf=0.5,
             iou=0.5,
             max_det=self.max_det,
-            device=0,          # or "cpu"
+            device=device,          # or "cpu"
             verbose=False
         )[0]
-        torch.cuda.synchronize()
+        if device != 'cpu':
+            torch.cuda.synchronize()
         t1 = time.perf_counter()
 
         # If YOLO returns nothing (e.g., empty frame), still account for the
@@ -848,8 +849,9 @@ def main():
     rs_rx = RealSenseRawUDPReceiver(
         listen_ip=deep_get(cfg, "network.pc_listen_ip", "0.0.0.0"),
         port=int(deep_get(cfg, "ports.rs_udp")),
-        timeout_ms=int(deep_get(cfg, "realsense.rs_timeout_ms", 200)),
-        max_inflight=int(deep_get(cfg, "realsense.max_inflight", 8)),
+        timeout_ms=int(deep_get(cfg, "realsense.rs_timeout_ms", 600)),
+        max_inflight=int(deep_get(cfg, "realsense.max_inflight", 64)),
+        print_every_s=1,
     )
 
     # ---------- Viewer -----------

@@ -64,12 +64,12 @@ class SpatialSoundHeadphoneYOLO:
                  sofa_file_path=sofa_glasses_file,
                  image_width=640.0,
                  verbose=False,
-                 bt_mac: str | None = None,
+                 bt_mac: str = None,
                  bt_pair: bool = False,
                  bt_trust: bool = True,
                  bt_connect_timeout_s: float = 20.0,
-                 output_blocksize: int | None = None,
-                 output_latency_s: float | None = None):
+                 output_blocksize: int  = None,
+                 output_latency_s: float  = None):
         # ---- Config ----
         self.image_width = float(image_width)
         self.yolo_counter = 0
