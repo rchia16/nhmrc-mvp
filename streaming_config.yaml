@@ -1,7 +1,9 @@
 network:
-  pc_ip: "192.168.50.1"
+  # pc_ip: "192.168.50.1" # pc eth
+  pc_ip: "192.168.0.184" # nuc tplink
   pc_listen_ip: "0.0.0.0"
-  pi_ip: "192.168.50.2"
+  # pi_ip: "192.168.50.2"
+  pi_ip: "192.168.0.236" # pi tplink
   pi_listen_ip: "0.0.0.0"
 
 ports:
@@ -17,8 +19,8 @@ realsense:
   fps: 15
   mtu_payload: 1400
   no_depth: false
-  rs_timeout_ms: 200
-  max_inflight: 8
+  rs_timeout_ms: 600
+  max_inflight: 64
 
 ppg:
   log_dir: "logs/"
