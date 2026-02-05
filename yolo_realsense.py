@@ -57,9 +57,10 @@ class RealSenseD455YOLOOSC:
                  x_size=640, y_size=480,
                  fps=30):
 
-        self.model = YOLO(model_path)
+        self.model = YOLO(model_path).to('cuda')
         self.conf_threshold = conf_threshold
         self.show_debug = show_debug
+        self.max_det = 10
 
         self.cls_names = self.model.names
 
@@ -180,7 +181,8 @@ class RealSenseD455YOLOOSC:
                 h, w, _ = color_image.shape
 
                 # YOLO inference
-                results = self.model(color_image, verbose=False)
+                results = self.model(color_image, verbose=False,
+                                     max_det=self.max_det)
                 result = results[0]
 
                 now = time.time()

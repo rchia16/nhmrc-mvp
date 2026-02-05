@@ -7,6 +7,7 @@ import sounddevice as sd
 from pythonosc import dispatcher, osc_server
 from collections import deque
 import numpy as np
+import platform
 import time
 from os.path import join
 
@@ -24,6 +25,7 @@ unlock_sound_file = join(sound_lib, 'mixkit-unlock-game-notification-253.wav')
 shortz_sound_file = join(sound_lib, 'Shortzz.mp3')
 scifi_sound_file = join(sound_lib, 'ui_sci-fi-sound-36061.wav')  # default
 
+MAX_OBJECTS_PER_SCENE = 2
 
 class SpatialSoundHeadphoneYOLO:
     """
@@ -62,12 +64,12 @@ class SpatialSoundHeadphoneYOLO:
                  sofa_file_path=sofa_glasses_file,
                  image_width=640.0,
                  verbose=False,
-                 bt_mac: str | None = None,
+                 bt_mac: str = None,
                  bt_pair: bool = False,
                  bt_trust: bool = True,
                  bt_connect_timeout_s: float = 20.0,
-                 output_blocksize: int | None = None,
-                 output_latency_s: float | None = None):
+                 output_blocksize: int  = None,
+                 output_latency_s: float  = None):
         # ---- Config ----
         self.image_width = float(image_width)
         self.yolo_counter = 0
@@ -76,12 +78,15 @@ class SpatialSoundHeadphoneYOLO:
 
         self.bt_manager = None
         if bt_mac:
-            self.bt_manager = BluetoothSpeakerManager(
-                bt_mac,
-                pair=bt_pair,
-                trust=bt_trust,
-                connect_timeout_s=bt_connect_timeout_s,
-            )
+            if platform.system().lower() == 'linux':
+                self.bt_manager = BluetoothSpeakerManager(
+                    bt_mac,
+                    pair=bt_pair,
+                    trust=bt_trust,
+                    connect_timeout_s=bt_connect_timeout_s,
+                )
+            else:
+                print("[BT] bluetoothctl not available; skipping autoconnect")
 
         # Scene timing
         self.inter_object_gap_s = 0.1
@@ -93,8 +98,12 @@ class SpatialSoundHeadphoneYOLO:
         self.output_blocksize = output_blocksize
         self.output_latency_s = output_latency_s
 
+        # Max buffered audio before we drop backlog ("latest wins") to avoid
+        # slow/laggy playback.
+        self.max_buffer_s = 0.5
+
         # Optional per-class cooldown across scenes (can be small or 0.0)
-        self.min_interval_between_plays = 0.0
+        self.min_interval_between_plays = 0.15
         self.last_play_time = {}  # cid_or_label -> last time played
 
         # ---- OSC dispatcher ----
@@ -111,11 +120,6 @@ class SpatialSoundHeadphoneYOLO:
         self.BRIRs = sofa.getDataIR()
         self.BRIR_samplerate = sofa.getSamplingRate()
         self.BRIR_sourcePositions = sofa.getVariableValue('SourcePosition')  # phi, theta, r
-
-        # ---- Audio device / samplerate ----
-        # sd.default.device = 'Speakers (Realtek(R) Audio), Windows DirectSound'
-        sd.default.samplerate = self.BRIR_samplerate
-        self._log_output_device_info(prefix="[AUDIO] Configured")
 
         # ---- Load YOLO sound sources (different objects → different sounds) ----
         self.setup_audio_sources()
@@ -139,6 +143,11 @@ class SpatialSoundHeadphoneYOLO:
         self._buffer_lock = threading.Lock()
         self._stream = None
 
+        # ---- Audio device / samplerate ----
+        # sd.default.device = 'Speakers (Realtek(R) Audio), Windows DirectSound'
+        sd.default.samplerate = self.BRIR_samplerate
+        self._log_output_device_info(prefix="[AUDIO] Configured")
+
         # ---- Playback thread ----
         # Start-ready as soon as the Pi process launches so streaming is
         # available immediately.
@@ -160,7 +169,10 @@ class SpatialSoundHeadphoneYOLO:
             else:
                 output_dev_idx = output_dev
 
-            dev_info = sd.query_devices(output_dev_idx)
+            dev_info = sd.query_devices(output_dev_idx, kind="output")
+            # Force output-only device to avoid input/output tuple mismatches
+            if output_dev_idx is not None:
+                sd.default.device = output_dev_idx
             hostapi = sd.query_hostapis(dev_info['hostapi'])
         except Exception as exc:  # noqa: BLE001 - diagnostics only
             print(f"{prefix} Unable to query output device info: {exc}")
@@ -202,8 +214,13 @@ class SpatialSoundHeadphoneYOLO:
     # Audio streaming helpers
     # ------------------------------------------------------------------
     def _stream_callback(self, outdata, frames, time_info, status):
+        # Never print every callback on Windows; it can cause/compound underflows.
         if status:
-            print(f"[STREAM] status: {status}")
+            now = time.time()
+            last = getattr(self, "_last_status_print", 0.0)
+            if now - last >= 1.0:
+                print(f"[STREAM] status: {status}")
+                self._last_status_print = now
         outdata.fill(0.0)
         with self._buffer_lock:
             remaining = frames
@@ -226,9 +243,21 @@ class SpatialSoundHeadphoneYOLO:
             channels=2,
             dtype='float32',
             callback=self._stream_callback,
+            blocksize=self.output_blocksize,
+            latency=self.output_latency_s,
         )
         self._stream.start()
         self._log_output_device_info(prefix="[AUDIO] Active stream")
+
+    def _buffer_seconds_locked(self) -> float:
+        total_frames = -self._audio_buffer_pos
+        for c in self._audio_buffer:
+            total_frames += c.shape[0]
+        return total_frames / float(self.BRIR_samplerate)
+
+    def _buffer_seconds(self) -> float:
+        with self._buffer_lock:
+            return self._buffer_seconds_locked()
 
     @staticmethod
     def _log_output_rms(audio_to_play: np.ndarray) -> None:
@@ -244,7 +273,25 @@ class SpatialSoundHeadphoneYOLO:
         if audio.ndim == 1:
             audio = np.stack([audio, audio], axis=-1)
         with self._buffer_lock:
+            if self.max_buffer_s and self._buffer_seconds_locked() > self.max_buffer_s:
+                self._audio_buffer.clear()
+                self._audio_buffer_pos = 0
             self._audio_buffer.append(audio)
+            n_chunks = len(self._audio_buffer)
+
+        # Throttle debug prints to avoid log-induced jitter.
+        now = time.time()
+        last = getattr(self, "_last_enqueue_print", 0.0)
+        if now - last >= 1.0:
+            try:
+                buf_s = self._buffer_seconds()
+            except Exception:
+                buf_s = -1.0
+            print(
+                f"[AUDIO] enqueued chunk frames={audio.shape[0]} "
+                f"buffer_chunks={n_chunks} buffer_s={buf_s:.2f}"
+            )
+            self._last_enqueue_print = now
 
     def enqueue_gap(self):
         gap_frames = int(self.inter_object_gap_s * self.BRIR_samplerate)
@@ -266,19 +313,38 @@ class SpatialSoundHeadphoneYOLO:
 
         def safe_load(path):
             try:
-                audio, fs = sf.read(path)
+                audio, fs = sf.read(path, always_2d=False)
                 print(f"Loaded audio: {path}")
                 return audio, fs
             except Exception as e:
                 print(f"Error loading audio file {path}: {e}")
                 return None, None
 
+        def to_stereo_at_brir_rate(audio, fs):
+            """Ensure audio matches BRIR samplerate and is stereo."""
+            if audio is None or fs is None:
+                return None, None
+            audio = np.asarray(audio, dtype=np.float32)
+            if audio.ndim == 1:
+                audio = np.stack([audio, audio], axis=1)
+            target_fs = int(self.BRIR_samplerate)
+            if fs != target_fs:
+                audio = signal.resample_poly(audio, target_fs, int(fs), axis=0)
+                fs = target_fs
+            return audio, fs
+
         # Load all candidate sounds
-        audio_default, fs_default = safe_load(scifi_sound_file)
-        audio_retro,   fs_retro   = safe_load(retro_sound_file)
-        audio_arcade,  fs_arcade  = safe_load(arcade_sound_file)
-        audio_unlock,  fs_unlock  = safe_load(unlock_sound_file)
-        audio_shortz,  fs_shortz  = safe_load(shortz_sound_file)
+        default = to_stereo_at_brir_rate(*safe_load(scifi_sound_file))
+        retro   = to_stereo_at_brir_rate(*safe_load(retro_sound_file))
+        arcade  = to_stereo_at_brir_rate(*safe_load(arcade_sound_file))
+        unlock  = to_stereo_at_brir_rate(*safe_load(unlock_sound_file))
+        shortz  = to_stereo_at_brir_rate(*safe_load(shortz_sound_file))
+
+        audio_default, fs_default = default
+        audio_retro,   fs_retro   = retro
+        audio_arcade,  fs_arcade  = arcade
+        audio_unlock,  fs_unlock  = unlock
+        audio_shortz,  fs_shortz  = shortz
 
         # Default sound (used when no specific class mapping found)
         if audio_default is not None:
@@ -449,7 +515,8 @@ class SpatialSoundHeadphoneYOLO:
                         self._log_output_rms(audio_to_play)
                         self.playing = True
                         self.enqueue_audio(audio_to_play)
-                        self.enqueue_gap()
+                        if self.current_scene_index + 1 < len(self.current_scene_objects):
+                            self.enqueue_gap()
                         self.playing = False
                         self.last_play_time[cid] = time.time()
                     else:
@@ -623,8 +690,15 @@ class SpatialSoundHeadphoneYOLO:
         index_source = np.argmin(distances)
         BRIR_this = BRIRs[index_source, :, :]
 
-        signal_this_left = signal.convolve(10 * audio, BRIR_this[0, :], mode='full')
-        signal_this_right = signal.convolve(10 * audio, BRIR_this[1, :], mode='full')
+        # signal_this_left = signal.convolve(10 * audio, BRIR_this[0, :], mode='full')
+        # signal_this_right = signal.convolve(10 * audio, BRIR_this[1, :], mode='full')
+        a = (10.0 * audio).astype(np.float32, copy=False)
+        hL = BRIR_this[0, :].astype(np.float32, copy=False)
+        hR = BRIR_this[1, :].astype(np.float32, copy=False)
+
+        signal_this_left  = signal.fftconvolve(a, hL, mode='full')
+        signal_this_right = signal.fftconvolve(a, hR, mode='full')
+
         signal_this = np.stack((signal_this_left, signal_this_right), axis=-1)
 
         return signal_this
@@ -645,6 +719,7 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
         osc_dispatcher = dispatcher.Dispatcher()
         osc_dispatcher.map("/yolo", self.yolo_handler)
         self.OSCserver = osc_server.ThreadingOSCUDPServer(("0.0.0.0", self.osc_port), osc_dispatcher)
+
 
     def yolo_handler(self, address, *args):
         """Handle /yolo messages that include x, y, depth, and frame id."""
@@ -727,7 +802,12 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
                     if not scene_dict:
                         continue
 
-                    items = sorted(scene_dict.items(), key=lambda kv: kv[1].get("depth_m", float("inf")))
+                    items = sorted(
+                        scene_dict.items(),
+                        key=lambda kv: kv[1].get("depth_m", float("inf"))
+                    )
+                    items = items[:MAX_OBJECTS_PER_SCENE]
+
 
                     self.current_scene_id = next_scene_id
                     self.current_scene_objects = items
@@ -770,13 +850,21 @@ class DepthAwareSpatialSound(SpatialSoundHeadphoneYOLO):
                             print(f"[SCENE] Playing scene {self.current_scene_id}, object index {self.current_scene_index}, "
                                   f"cid={cid}, depth={obj.get('depth_m', 'n/a')}")
 
-                        audio_to_play = self.prepare_sound_yolo(self.yolo_counter, audio, is_mono=is_mono)
+                        # Optional backpressure: let callback drain a little.
+                        # NOTE: enqueue_audio() now enforces a hard cap via 
+                        # max_buffer_s (latest wins).
+                        if self._buffer_seconds() > (self.max_buffer_s or 0.5):
+                            time.sleep(0.01)
+
+                        audio_to_play = self.prepare_sound_yolo(
+                            self.yolo_counter, audio, is_mono=is_mono)
                         self.yolo_counter += 1
 
                         if audio_to_play is not None:
                             self._log_output_rms(audio_to_play)
                             self.enqueue_audio(audio_to_play)
-                            self.enqueue_gap()
+                            if self.current_scene_index + 1 < len(self.current_scene_objects):
+                                self.enqueue_gap()
                             self.playing = False
                             self.last_play_time[cid] = time.time()
                         else:

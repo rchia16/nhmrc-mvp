@@ -17,6 +17,7 @@ Run:
 
 from __future__ import annotations
 
+import sys
 import argparse
 import io
 import os
@@ -24,7 +25,8 @@ import time
 import random
 import struct
 import threading
-from typing import Dict, Optional, Tuple
+import subprocess
+from typing import Dict, Optional, Tuple, List
 from dataclasses import dataclass
 
 import numpy as np
@@ -33,6 +35,8 @@ import soundfile as sf
 from scipy import signal
 from ultralytics import YOLO
 from pythonosc import udp_client
+import pyrealsense2 as rs
+import torch
 
 # ---------------- REQUIRED PROJECT IMPORTS ----------------
 
@@ -44,11 +48,13 @@ from config import deep_get, load_config
 # import updated receiver library
 from rs_d455_raw_udp_receiver import (
     RealSenseRawUDPReceiver,
+    RealSenseRawUDPViewer,
     ReceiverStats,
 )
 
 from rgbd_coord_streamer import App as VisAudioStreamer
 
+device = 'cpu'
 
 # ---------------- PPG RECEIVER ----------------
 
@@ -164,28 +170,85 @@ def wav_bytes_to_pcm16_frames(wav_bytes: bytes, frame_bytes: int):
 
 # ---------------- SOFA SPATIALISER ----------------
 class YoloOSCStreamer:
-    """Send YOLO detections to a local OSC spatialiser on the PC."""
+    """
+    Send YOLO detections to a local OSC spatialiser on the PC.
+
+    Updated: "scene-period" batching.
+      - Collect detections for scene_period_ms
+      - At end of scene period, send up to max_objects (default 5),
+        prioritised by closest distance (smallest r).
+      - Keeps receiver compatible by sending standard "/yolo" messages.
+    """
 
     def __init__(self, cfg: Dict, osc_host: str, osc_port: int):
         self.cfg = cfg
-        self.model = YOLO(deep_get(cfg, "yolo.model"))
+        self.model = YOLO(deep_get(cfg, "yolo.model")).to(device)
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
         self.osc = udp_client.SimpleUDPClient(osc_host, int(osc_port))
-        self.frame_id = 0
+        # Scene batching
+        self.scene_period_ms = int(deep_get(cfg, "audio.scene.window_ms", 1200))
+        self.max_objects = int(deep_get(cfg, "audio.scene.max_objects", 3))
+        self._scene_start_t = time.time()
+        self._scene_id = 0
+        self._pending: List[Tuple[float, int, str, float]] = []  # (r, cx_rgb, label, y_norm)
+
+        # Optional keepalive (helps keep pipelines "warm" when no detections)
+        self.keepalive_ms = int(deep_get(cfg, "audio.osc_keepalive_ms", 0))  # 0 disables
+        self._last_keepalive_t = time.time()
+
+        self.max_det = int(deep_get(cfg, "yolo.max_det", 10))
+        self._timing_samples = []
+        self._timing_report_every = 30  # frames
+
+        # Align depth to color
+        self.align = rs.align(rs.stream.color)
 
     def process(self, pkt: Dict):
         rgb = pkt["color"]
         depth = pkt.get("depth")
         depth_scale = pkt.get("depth_scale", 0.001)
 
-        h, w = rgb.shape[:2]
-        res = self.model(rgb, verbose=False)[0]
+        depth_image = depth
+        color_image = rgb
 
-        if res.boxes is None:
+        h, w = color_image.shape[:2]
+
+        t0 = time.perf_counter()
+        now = time.time()
+
+        # Periodic flush (scene boundary)
+        if (now - self._scene_start_t) * 1000.0 >= self.scene_period_ms:
+            self._flush_scene()
+            self._scene_start_t = now
+
+        # Optional keepalive tick (doesn't play sound by itself unless receiver maps it)
+        if self.keepalive_ms > 0 and (now - self._last_keepalive_t) * 1000.0 >= self.keepalive_ms:
+            # If your receiver ignores this address, it’s harmless.
+            # If you later add a handler, you can use it to keep a quiet bed/noise alive.
+            self.osc.send_message("/keepalive", [int(self._scene_id)])
+            self._last_keepalive_t = now
+
+        res = self.model.predict(
+            color_image,
+            imgsz=416,
+            conf=0.5,
+            iou=0.5,
+            max_det=self.max_det,
+            device=device,          # or "cpu"
+            verbose=False
+        )[0]
+        if device != 'cpu':
+            torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        # If YOLO returns nothing (e.g., empty frame), still account for the
+        # inference time so the periodic profiler can emit a line.
+        if res.boxes is None or len(res.boxes) == 0:
+            self._record_timing(t1 - t0, 0.0)
             return
 
-        frame_id = self.frame_id
-        self.frame_id += 1
+        # frame_id = self.frame_id
+        # self.frame_id += 1
 
         for box in res.boxes:
             conf = float(box.conf[0])
@@ -200,17 +263,70 @@ class YoloOSCStreamer:
             y_norm = cy_rgb / float(max(1.0, h))
 
             r = 1.0
-            if depth is not None:
-                dh, dw = depth.shape[:2]
+            if depth_image is not None:
+                dh, dw = depth_image.shape[:2]
                 cx_d = int(cx_rgb * dw / w)
                 cy_d = int(cy_rgb * dh / h)
                 cx_d = max(0, min(dw - 1, cx_d))
                 cy_d = max(0, min(dh - 1, cy_d))
-                d = depth[cy_d, cx_d]
+                d = depth_image[cy_d, cx_d]
                 if d > 0:
                     r = float(d) * depth_scale
 
-            self.osc.send_message("/yolo", [cx_rgb, label, y_norm, r, frame_id])
+            # self.osc.send_message("/yolo", [cx_rgb, label, y_norm, r, frame_id])
+            # Collect for this scene period; receiver will be driven by scene flush.
+            self._pending.append((r, cx_rgb, label, float(y_norm)))
+
+        # Basic profiling so we can pinpoint OSC slowdown sources.
+        # Model inference dominates when OSC streams feel sluggish.
+        t2 = time.perf_counter()
+        print("model inference: ", t1 - t0, "osc messages: ", t2-t1)
+        # self._record_timing(t1-t0, t2-t1)
+
+
+    def _flush_scene(self):
+        """
+        Send at most max_objects, prioritised by closest (smallest r).
+        Uses "/yolo" address for compatibility.
+        """
+        if not self._pending:
+            # still increment scene id so keepalive has monotonic ids if enabled
+            self._scene_id += 1
+            return
+
+        # Prefer closest objects; also de-duplicate by label to avoid spamming the same class
+        # (optional but usually desirable). Keeps the closest instance of each label.
+        by_label: Dict[str, Tuple[float, int, str, float]] = {}
+        for item in self._pending:
+            r, cx, label, y_norm = item
+            prev = by_label.get(label)
+            if prev is None or r < prev[0]:
+                by_label[label] = item
+
+        candidates = list(by_label.values())
+        candidates.sort(key=lambda t: t[0])  # r ascending (closest first)
+        selected = candidates[: max(1, self.max_objects)]
+
+        scene_id = int(self._scene_id)
+        for (r, cx_rgb, label, y_norm) in selected:
+            # Frame/scene id used as the "frame_id" field expected by your receiver.
+            self.osc.send_message("/yolo", [int(cx_rgb), str(label), float(y_norm), float(r), scene_id])
+
+        self._pending.clear()
+        self._scene_id += 1
+
+    def _record_timing(self, inference_s:float, osc_s:float):
+        """Collect and periodically print YOLO→OSC timing averages."""
+        self._timing_samples.append((inference_s, osc_s))
+        if len(self._timing_samples) >= self._timing_report_every:
+            inf_avg = sum(s[0] for s in self._timing_samples) / len(self._timing_samples)
+            osc_avg = sum(s[1] for s in self._timing_samples) / len(self._timing_samples)
+            print(
+                f"[YOLO→OSC] avg inference={inf_avg*1000:.1f} ms, "
+                f"avg osc/packaging={osc_avg*1000:.1f} ms over {len(self._timing_samples)} frames"
+            )
+            self._timing_samples.clear()
+
 
 
 class SofaSpatialiser:
@@ -286,6 +402,7 @@ class SofaSpatialiser:
         Spatialise and return float32 stereo array + sample rate.
         Optional clip_override_s lets callers force a shorter windowed render.
         """
+        t0 = time.time()
         clip_s = self.clip_s if clip_override_s is None else float(clip_override_s)
 
         audio, fs_src = sf.read(mono_path, dtype="float32", always_2d=False)
@@ -335,6 +452,8 @@ class SofaSpatialiser:
             stereo *= min(1.0, self.max_peak / peak)
         stereo = np.clip(stereo, -1.0, 1.0)
 
+        print("----------\n- spatialise array: ", time.time()-t0, "\n---------")
+
         return stereo.astype(np.float32, copy=False), int(self.out_sr)
 
     def spatialise_file(self, mono_path: str, az_deg: float, r: float) -> bytes:
@@ -372,7 +491,7 @@ class SceneAudioWindowMixer:
         pcm_params: Optional[object],
         window_ms: int = 200,
         max_objects: int = 3,
-        repeat_chunk0: int = 4,
+        repeat_chunk0: int = 1,
     ):
         self.spatialiser = spatialiser
         self.audio_sender = audio_sender
@@ -384,6 +503,43 @@ class SceneAudioWindowMixer:
 
         self.events: List[SceneAudioEvent] = []
         self.window_start = time.time()
+
+        # Mix and transmit in the background so rendering one window doesn't
+        # block the detector loop that is accumulating the next window.
+        self._stop_evt = threading.Event()
+        self._mix_queue: Queue[list[SceneAudioEvent]] = Queue(maxsize=2)
+        self._worker = threading.Thread(target=self._mix_worker, daemon=True)
+        self._worker.start()
+
+    def _mix_worker(self):
+        while not self._stop_evt.is_set():
+            try:
+                events = self._mix_queue.get(timeout=0.5)
+            except Empty:
+                continue
+
+            try:
+                wav_bytes = self._mix_events(events)
+                if wav_bytes:
+                    self._send_audio(wav_bytes)
+            finally:
+                self._mix_queue.task_done()
+
+    def _enqueue_mix(self, events: list[SceneAudioEvent]):
+        try:
+            self._mix_queue.put_nowait(events)
+        except Full:
+            # Drop the oldest in-flight mix so the latest scene can be rendered
+            # while the previous one plays.
+            try:
+                _ = self._mix_queue.get_nowait()
+            except Empty:
+                pass
+            try:
+                self._mix_queue.put_nowait(events)
+            except Full:
+                # If another thread raced us, just drop this window.
+                pass    
 
     def add_event(self, event: SceneAudioEvent):
         self.events.append(event)
@@ -432,21 +588,7 @@ class SceneAudioWindowMixer:
         sf.write(buf, stereo_mix, int(sr_out), format="WAV", subtype="PCM_16")
         return buf.getvalue()
 
-    def maybe_flush(self, now: Optional[float] = None):
-        now = time.time() if now is None else now
-        if (now - self.window_start) * 1000.0 < self.window_ms:
-            return
-        self.flush(now)
-
-    def flush(self, now: Optional[float] = None):
-        now = time.time() if now is None else now
-        wav_bytes = self._mix_events(self.events)
-        self.events = []
-        self.window_start = now
-
-        if wav_bytes is None:
-            return
-
+    def _send_audio(self, wav_bytes: bytes):
         # Prefer continuous PCM streaming when available
         if self.pcm_stream is not None and self.pcm_params is not None:
             frame_bytes = int(getattr(self.pcm_params, "frame_bytes"))
@@ -458,6 +600,33 @@ class SceneAudioWindowMixer:
                 wav_bytes,
                 repeat_chunk0=self.repeat_chunk0,
             )
+
+    def maybe_flush(self, now: Optional[float] = None):
+        now = time.time() if now is None else now
+        if (now - self.window_start) * 1000.0 < self.window_ms:
+            return
+        self.flush(now)
+
+    def flush(self, now: Optional[float] = None):
+        now = time.time() if now is None else now
+        events = list(self.events)
+        self.events = []
+        self.window_start = now
+        if events:
+            self._enqueue_mix(events)
+
+    def stop(self):
+        self._stop_evt.set()
+        try:
+            while not self._mix_queue.empty():
+                try:
+                    _ = self._mix_queue.get_nowait()
+                    self._mix_queue.task_done()
+                except Empty:
+                    break
+        except Exception:
+            pass
+        self._worker.join(timeout=1.0)
 
 
 
@@ -473,8 +642,9 @@ class YoloSofaSonifier:
         pcm_params: Optional[object] = None,
     ):
         self.cfg = cfg
-        self.model = YOLO(deep_get(cfg, "yolo.model"))
+        self.model = YOLO(deep_get(cfg, "yolo.model")).to(device)
         self.conf = float(deep_get(cfg, "yolo.conf", 0.3))
+        self.max_det = int(deep_get(cfg, 'yolo.max_det', 10))
 
         self.audio_sender = audio_sender
         self.spatialiser = spatialiser
@@ -507,7 +677,9 @@ class YoloSofaSonifier:
         depth_scale = pkt.get("depth_scale", 0.001)
 
         h, w = rgb.shape[:2]
-        res = self.model(rgb, verbose=False)[0]
+        print("color: ", pkt['color'].shape)
+        print("depth: ", pkt['depth'].shape)
+        res = self.model(rgb, verbose=False, max_det=self.max_det)[0]
 
         if res.boxes is None:
             self.scene_mixer.maybe_flush(time.time())
@@ -536,6 +708,9 @@ class YoloSofaSonifier:
             x_norm = cx_rgb / w
             az = -90.0 + 180.0 * x_norm
 
+            # debug timing
+            print("compute bbox and azimuth: ", time.time()-now)
+
             r = 1.0
             if depth is not None:
                 dh, dw = depth.shape[:2]
@@ -551,6 +726,9 @@ class YoloSofaSonifier:
                 d = depth[cy_d, cx_d]
                 if d > 0:
                     r = float(d) * depth_scale
+
+                # debug timing
+                print("compute depth: ", time.time()-now)
 
             # 1) cooldown (existing)
             if now - self.last_play.get(label, 0) < self.per_label_cooldown_s:
@@ -572,8 +750,13 @@ class YoloSofaSonifier:
         for ev in pending_events:
             self.scene_mixer.add_event(ev)
 
+        # debug timing
+        print("adding events: ", time.time()-now)
+
         # Send one clip per window (packetised PCM preferred)
         self.scene_mixer.maybe_flush(time.time())
+        # debug timing
+        print("one clip per window: ", time.time()-now)
 
         if pending_events:
             labels = ", ".join([ev.label for ev in pending_events])
@@ -607,7 +790,7 @@ def _run_pc_spatialiser(cfg: Dict, stop_evt: threading.Event):
         sofa_file_path=sofa_path,
         image_width=image_width,
         osc_port=osc_port,
-        verbose=True,
+        verbose=False,
         bt_mac=str(deep_get(cfg, "audio.bt_mac", "")) or None,
         bt_pair=bool(deep_get(cfg, "audio.pair", False)),
         bt_trust=bool(deep_get(cfg, "audio.trust", True)),
@@ -621,18 +804,44 @@ def _run_pc_spatialiser(cfg: Dict, stop_evt: threading.Event):
 
     try:
         while not stop_evt.is_set():
-            time.sleep(0.2)
+            time.sleep(0.1)
     finally:
         try:
             app.OSCserver.server_close()
         except Exception:
             pass
 
+def run_spatialiser_process(cfg_path: str):
+    """
+    Entry point for the standalone spatialiser process.
+    Keeps the spatialiser in a separate OS process to avoid CPU contention
+    affecting YOLO timing.
+    """
+    cfg = load_config(cfg_path)
+    stop_evt = threading.Event()
+    _run_pc_spatialiser(cfg, stop_evt)
+
 
 def main():
+    '''
+    Spatialiser only for debugging:
+        python pc_main.py --config streaming_config.yaml --run-spatialiser
+    
+    '''
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="./streaming_config.yaml")
+    ap.add_argument(
+        "--run-spatialiser",
+        action="store_true",
+        help="Run only the OSC/BT spatialiser (used when launched as a child process).",
+    )
     args = ap.parse_args()
+
+    # Child-process mode: just run the spatialiser and block forever
+    if args.run_spatialiser:
+        run_spatialiser_process(args.config)
+        return
+
 
     cfg = load_config(args.config)
 
@@ -640,8 +849,15 @@ def main():
     rs_rx = RealSenseRawUDPReceiver(
         listen_ip=deep_get(cfg, "network.pc_listen_ip", "0.0.0.0"),
         port=int(deep_get(cfg, "ports.rs_udp")),
-        timeout_ms=int(deep_get(cfg, "realsense.rs_timeout_ms", 200)),
-        max_inflight=int(deep_get(cfg, "realsense.max_inflight", 8)),
+        timeout_ms=int(deep_get(cfg, "realsense.rs_timeout_ms", 600)),
+        max_inflight=int(deep_get(cfg, "realsense.max_inflight", 64)),
+        print_every_s=1,
+    )
+
+    # ---------- Viewer -----------
+    viewer = RealSenseRawUDPViewer(
+        show_rgb=True,
+        show_depth=True,
     )
 
     # ---------- PPG ----------
@@ -652,40 +868,64 @@ def main():
     )
     ppg_rx.start()
 
-    # ---------- Audio / OSC spatialisation on PC ----------
-    stop_evt = threading.Event()
-    spatial_thread = threading.Thread(
-        target=_run_pc_spatialiser,
-        args=(cfg, stop_evt),
-        daemon=True,
-    )
-    spatial_thread.start()    
+    # ---------- Audio / OSC spatialisation on PC (separate process) ----------
+    spatial_proc: Optional[subprocess.Popen] = None
+    try:
+        spatial_proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--config", 
+             args.config, "--run-spatialiser"],
+            stdout=None,
+            stderr=None,
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP \
+                           if os.name == "nt" else 0),
+        )
+    except Exception as e:
+        print(f"[PC] Failed to start spatialiser process: {e}")
+        spatial_proc = None
 
     osc_port = int(deep_get(cfg, "ports.audio_udp", 40100))
-    sonifier: Optional[YoloOSCStreamer] = None
+    # sonifier: Optional[YoloOSCStreamer] = None
     sonifier = YoloOSCStreamer(cfg, "127.0.0.1", osc_port)    
 
     print("[PC] Running: RS → YOLO → OSC → BT (local)")
 
-    av_stream = VisAudioStreamer(cfg, rs_rx=rs_rx)
+    def process_frame(pkt: Dict):
+        """Process the newest frame inline: YOLO → spatialisation."""
+        if pkt and sonifier is not None:
+            sonifier.process(pkt)
+    # av_stream = VisAudioStreamer(cfg, rs_rx=rs_rx)
 
     try:
         # Run the RGB-D visual/audio streamer in the background (shares the
         # same UDP socket)
-        av_stream.start(background=True)
+        # av_stream.start(background=True)
         rs_rx.start()
         while True:
             pkt = rs_rx.get_latest()
-            if pkt and sonifier is not None:
-                sonifier.process(pkt)
+            # if pkt and sonifier is not None:
+            #     sonifier.process(pkt)
+            process_frame(pkt)
+            
             time.sleep(1.0 / float(deep_get(cfg, "yolo.yolo_hz", 10)))
+        # Process frames synchronously as they arrive from the UDP stream.
+        rs_rx.on_frame = process_frame
+        rs_rx.run_forever()
     except KeyboardInterrupt:
         print("\n[PC] Shutdown")
     finally:
-        stop_evt.set()
-        av_stream.stop()
+        # av_stream.stop()
         rs_rx.stop()
         ppg_rx.stop()
+        if spatial_proc is not None:
+            try:
+                # Graceful terminate first
+                spatial_proc.terminate()
+                spatial_proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    spatial_proc.kill()
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":

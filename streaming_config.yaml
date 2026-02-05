@@ -1,10 +1,10 @@
 network:
-  # pc_ip: "192.168.50.1"
-  pc_ip: "192.168.0.184"
+  # pc_ip: "192.168.50.1" # pc eth
+  pc_ip: "192.168.0.184" # nuc tplink
   # pc_ip: "192.168.0.194" # aria pc
   pc_listen_ip: "0.0.0.0"
   # pi_ip: "192.168.50.2"
-  pi_ip: "192.168.0.236"
+  pi_ip: "192.168.0.236" # pi tplink
   pi_listen_ip: "0.0.0.0"
 
 ports:
@@ -20,8 +20,8 @@ realsense:
   fps: 15
   mtu_payload: 1400
   no_depth: false
-  rs_timeout_ms: 200
-  max_inflight: 8
+  rs_timeout_ms: 600
+  max_inflight: 64
 
 ppg:
   log_dir: "logs/"
@@ -44,9 +44,12 @@ audio:
   send_chunk_bytes: 1200
   send_inter_packet_sleep_s: 0.05
   send_sndbuf_bytes: 8388608
+  send_repeat_chunk0: 1
   min_inter_file_gap_s: 0.15
   per_label_cooldown_s: 1.2
   volume: 1.0
+  output_blocksize: 2048
+  output_latency_s: 0.15
   scene:
     window_ms: 1000
     max_objects: 1
@@ -64,11 +67,12 @@ audio:
 
 yolo:
   model: "yolov8n.pt"
-  conf: 0.30
+  conf: 0.50 # 0.30
   stable_seconds: 0.20
   forget_seconds: 1.00
   cooldown_seconds: 0.60
-  yolo_hz: 10.0
+  yolo_hz: 5.0
+  max_det: 4
 
 sonification:
   default_sound: "./sound-lib/ui_sci-fi-sound-36061.wav"

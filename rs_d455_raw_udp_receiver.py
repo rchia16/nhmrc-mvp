@@ -224,6 +224,7 @@ class RealSenseRawUDPReceiver:
         max_inflight: int = 8,
         rcvbuf_bytes: int = 1 << 22,
         on_frame: Optional[FrameCallback] = None,
+        print_every_s:float=0.0,
     ):
         self.listen_ip = str(listen_ip)
         self.port = int(port)
@@ -231,6 +232,11 @@ class RealSenseRawUDPReceiver:
         self.max_inflight = int(max_inflight)
         self.rcvbuf_bytes = int(rcvbuf_bytes)
         self.on_frame = on_frame
+
+        # If > 0, periodically print RX stats to console from receiver thread.
+        self.print_every_s = float(print_every_s)
+        self._last_print_t = 0.0
+        self._last_print_seq = None
 
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -282,6 +288,7 @@ class RealSenseRawUDPReceiver:
         timeout_s = self.timeout_ms / 1000.0
         t0 = time.time()
         last_stat = t0
+        last_hb = t0
 
         try:
             while not self._stop_evt.is_set():
@@ -329,6 +336,12 @@ class RealSenseRawUDPReceiver:
                             frames.pop(seq, None)
                             with self._stats_lock:
                                 self._stats.frames_ok += 1
+                    else:
+                        # Not our protocol - useful debug
+                        if self.print_every_s and self.print_every_s > 0.0:
+                            print(f"[RX] got UDP but bad chunk " \
+                                  f"magic={magic!r} len={len(data)}",
+                                  flush=True)
 
                 # parse + publish latest
                 if newest_complete is not None:
@@ -350,6 +363,16 @@ class RealSenseRawUDPReceiver:
                         with self._latest_lock:
                             self._latest_pkt = pkt
 
+                        if self.print_every_s and self.print_every_s > 0.0:
+                            now2 = time.time()
+                            if (now2 - self._last_print_t) >= self.print_every_s:
+                                st = self.get_stats()
+                                seq2 = int(pkt.get("fseq", -1))
+                                print(f"[RX] seq={seq2} ok={st.frames_ok} "\
+                                      f"drop={st.frames_drop} fps={st.fps:.1f}")
+                                self._last_print_t = now2
+                                self._last_print_seq = seq2
+
                         if self.on_frame is not None:
                             try:
                                 self.on_frame(pkt)
@@ -363,6 +386,16 @@ class RealSenseRawUDPReceiver:
                         dt = max(1e-6, (now - t0))
                         self._stats.fps = float(self._stats.frames_ok) / dt
                     last_stat = now
+
+                # HEARTBEAT (prints even if no frames parse)
+                if self.print_every_s and self.print_every_s > 0.0:
+                    if (now - last_hb) >= self.print_every_s:
+                        st = self.get_stats()
+                        print(f"[RX] ok={st.frames_ok} drop={st.frames_drop} " \
+                              f"fps={st.fps:.1f} " \
+                              f"last_latency_ms={st.last_latency_ms:.1f}",
+                              flush=True)
+                        last_hb = now
 
         finally:
             try:
@@ -433,10 +466,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--listen-ip", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=50010)
-    ap.add_argument("--timeout-ms", type=int, default=200)
-    ap.add_argument("--max-inflight", type=int, default=8)
+    ap.add_argument("--timeout-ms", type=int, default=600)
+    ap.add_argument("--max-inflight", type=int, default=64)
     ap.add_argument("--show-depth", action="store_true")
     ap.add_argument("--no-rgb", action="store_true")
+    ap.add_argument("--print-every", type=float, default=1.0,
+                    help="Print RX stats every N seconds (0 disables).")
     args = ap.parse_args()
 
     receiver = RealSenseRawUDPReceiver(
@@ -445,6 +480,7 @@ def main():
         timeout_ms=args.timeout_ms,
         max_inflight=args.max_inflight,
         on_frame=None,  # viewer polls
+        print_every_s=args.print_every,
     )
     receiver.start()
 
