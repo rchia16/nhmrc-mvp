@@ -256,7 +256,8 @@ class RealSenseD455TCPSender:
 def main():
     # CHANGE THIS to your desktop PC's IP address
     # desktop_ip = "192.168.0.194" # wifi
-    desktop_ip = "192.168.50.1" # eth0
+    # desktop_ip = "192.168.50.1" # eth0
+    desktop_ip = "192.168.0.184" # wifi-nuc
     port = 50000
 
     sender = RealSenseD455TCPSender(
