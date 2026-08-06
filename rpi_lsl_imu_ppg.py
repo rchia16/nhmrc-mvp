@@ -136,8 +136,9 @@ class LSLIMUPublisher:
 class LSLPPGPublisher:
     CHANNELS = ("utc_unix_s", "red", "ir")
 
-    def __init__(self, name: str, source_id: str, poll_sleep_ms: float, rate_print: bool):
-        info = StreamInfo(name, "PPG", len(self.CHANNELS), 200.0, "float64", source_id)
+    def __init__(self, name: str, source_id: str, poll_sleep_ms: float, sample_rate_hz: float, rate_print: bool):
+        self.sample_rate_hz = float(sample_rate_hz)
+        info = StreamInfo(name, "PPG", len(self.CHANNELS), self.sample_rate_hz, "float64", source_id)
         _append_channels(info, self.CHANNELS)
         info.desc().append_child_value("clock", "sample channel 0 is UTC Unix seconds")
 
@@ -177,9 +178,11 @@ class LSLPPGPublisher:
                     print(f"[LSL][PPG] read error: {e}")
 
                 if batch:
-                    for utc, red, ir in batch:
-                        self.outlet.push_sample([float(utc), float(red), float(ir)], timestamp=local_clock())
-                    self.rate.add(len(batch))
+                    n = len(batch)
+                    for i, (utc, red, ir) in enumerate(batch):
+                        sample_utc = float(utc) - max(0, n - 1 - i) / max(1.0, self.sample_rate_hz)
+                        self.outlet.push_sample([sample_utc, float(red), float(ir)], timestamp=local_clock())
+                    self.rate.add(n)
 
                 time.sleep(self.poll_sleep_ms / 1000.0)
         finally:
@@ -196,6 +199,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--accel-hz", type=int, default=None)
     ap.add_argument("--gyro-hz", type=int, default=None)
     ap.add_argument("--ppg-poll-sleep-ms", type=float, default=None)
+    ap.add_argument("--ppg-sample-rate-hz", type=float, default=None)
     ap.add_argument("--rate-print", action="store_true")
     return ap
 
@@ -211,6 +215,7 @@ def main() -> None:
     accel_hz = args.accel_hz or int(deep_get(cfg, "lsl.accel_hz", 250))
     gyro_hz = args.gyro_hz or int(deep_get(cfg, "lsl.gyro_hz", 400))
     ppg_poll_sleep_ms = args.ppg_poll_sleep_ms or float(deep_get(cfg, "ppg.poll_sleep_ms", 5.0))
+    ppg_sample_rate_hz = args.ppg_sample_rate_hz or float(deep_get(cfg, "lsl.ppg_sample_rate_hz", 200.0))
     rate_print = bool(args.rate_print or deep_get(cfg, "lsl.rate_print", False))
 
     stop_evt = threading.Event()
@@ -233,6 +238,7 @@ def main() -> None:
         name=ppg_stream_name,
         source_id=f"{source_id_prefix}_ppg",
         poll_sleep_ms=ppg_poll_sleep_ms,
+        sample_rate_hz=ppg_sample_rate_hz,
         rate_print=rate_print,
     )
 
