@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import threading
+import time
 
 import pyrealsense2 as rs
 
@@ -9,6 +10,10 @@ class IMUReader:
         self.lock = threading.Lock()
         self.accel = None
         self.gyro = None
+        self.accel_utc = None
+        self.gyro_utc = None
+        self.accel_seq = 0
+        self.gyro_seq = 0
 
         # Find a sensor that actually has accel/gyro profiles (don't rely on name)
         self.motion_sensor = None
@@ -55,15 +60,31 @@ class IMUReader:
         m = f.as_motion_frame()
         data = m.get_motion_data()
         st = m.get_profile().stream_type()
+        ts_utc = time.time()
         with self.lock:
             if st == rs.stream.accel:
                 self.accel = (data.x, data.y, data.z)
+                self.accel_utc = ts_utc
+                self.accel_seq += 1
             elif st == rs.stream.gyro:
                 self.gyro = (data.x, data.y, data.z)
+                self.gyro_utc = ts_utc
+                self.gyro_seq += 1
 
     def get_latest(self):
         with self.lock:
             return self.accel, self.gyro
+
+    def get_latest_timestamped(self):
+        with self.lock:
+            return {
+                "accel": self.accel,
+                "gyro": self.gyro,
+                "accel_utc": self.accel_utc,
+                "gyro_utc": self.gyro_utc,
+                "accel_seq": self.accel_seq,
+                "gyro_seq": self.gyro_seq,
+            }
 
     def stop(self):
         try:

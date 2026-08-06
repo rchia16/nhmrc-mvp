@@ -30,6 +30,15 @@ ppg:
   poll_sleep_ms: 5.0
   pc_poll_hz: 500.0
 
+lsl:
+  imu_stream_name: "NHMRC_IMU"
+  ppg_stream_name: "NHMRC_PPG"
+  source_id_prefix: "nhmrc"
+  accel_hz: 250
+  gyro_hz: 400
+  imu_poll_hz: 500.0
+  rate_print: true
+
 audio:
   bt_mac: "28:FA:19:0F:E9:CF"
   pair: true
@@ -80,3 +89,4 @@ sonification:
     chair: "./sound-lib/mixkit-arcade-mechanical-bling-210.wav"
     door:  "./sound-lib/mixkit-unlock-game-notification-253.wav"
     object: "./sound-lib/Shortzz.mp3"
+
