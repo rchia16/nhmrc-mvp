@@ -31,8 +31,8 @@ ppg:
   pc_poll_hz: 500.0
 
 lsl:
-  imu_stream_name: "NHMRC_IMU"
-  ppg_stream_name: "NHMRC_PPG"
+  imu_stream_name: "RPI_IMU"
+  ppg_stream_name: "RPI_PPG"
   source_id_prefix: "nhmrc"
   accel_hz: 250
   gyro_hz: 400
