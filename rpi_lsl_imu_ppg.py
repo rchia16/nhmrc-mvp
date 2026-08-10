@@ -70,7 +70,7 @@ class LSLIMUPublisher:
     )
 
     def __init__(self, name: str, source_id: str, accel_hz: int, gyro_hz: int, poll_hz: float, rate_print: bool):
-        info = StreamInfo(name, "IMU", len(self.CHANNELS), 0.0, "float64", source_id)
+        info = StreamInfo(name, "IMU", len(self.CHANNELS), 0.0, "double64", source_id)
         _append_channels(info, self.CHANNELS)
         info.desc().append_child_value("clock", "sample channel 0 is UTC Unix seconds")
 
@@ -138,7 +138,8 @@ class LSLPPGPublisher:
 
     def __init__(self, name: str, source_id: str, poll_sleep_ms: float, sample_rate_hz: float, rate_print: bool):
         self.sample_rate_hz = float(sample_rate_hz)
-        info = StreamInfo(name, "PPG", len(self.CHANNELS), self.sample_rate_hz, "float64", source_id)
+        info = StreamInfo(name, "PPG", len(self.CHANNELS), self.sample_rate_hz,
+                          "double64", source_id)
         _append_channels(info, self.CHANNELS)
         info.desc().append_child_value("clock", "sample channel 0 is UTC Unix seconds")
 
