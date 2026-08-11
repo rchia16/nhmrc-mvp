@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-rpi_pico_lsl.py
+rpi_pico_lsl_handshake.py
 
-Raspberry Pi LSL bridge for the unified Raspberry Pi Pico acquisition firmware:
+Raspberry Pi -> LSL bridge for the unified Raspberry Pi Pico binary DAQ firmware:
 
     BNO085   -> Pico I2C0
     MAX30102 -> Pico I2C1
@@ -84,9 +84,9 @@ Dependencies
 
 Examples
 --------
-    python3 rpi_pico_lsl.py
-    python3 rpi_pico_lsl.py --verbose
-    python3 rpi_pico_lsl.py --port /dev/ttyACM0
+    python3 rpi_pico_lsl_handshake.py
+    python3 rpi_pico_lsl_handshake.py --verbose
+    python3 rpi_pico_lsl_handshake.py --port /dev/ttyACM0
 """
 
 from __future__ import annotations
@@ -147,7 +147,7 @@ SERIAL_BAUD = 500_000
 
 STREAM_PREFIX = "daq"
 
-ACCEL_RATE_HZ = 200.0
+ACCEL_RATE_HZ = 250.0
 GYRO_RATE_HZ = 200.0
 QUAT_RATE_HZ = 100.0
 PPG_RATE_HZ = 200.0
@@ -610,8 +610,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--startup-delay",
         type=float,
-        default=1.0,
-        help="Seconds to wait after opening Pico USB CDC before clearing stale input.",
+        default=0.20,
+        help="Seconds to let USB CDC settle before the START handshake.",
     )
     ap.add_argument("--serial-queue", type=int, default=20000)
 
@@ -654,11 +654,35 @@ def main() -> int:
         print(f"[DAQ] Could not open serial port: {exc}", file=sys.stderr)
         return 2
 
-    # Pico native USB CDC does not require UART baud matching. Give a newly
-    # connected/rebooted board a short settling period, then discard any partial
-    # frame already sitting in the Linux tty buffer.
+    # Explicitly assert the USB CDC modem-control lines. The Pico firmware
+    # uses DTR as the host-ready signal before it starts binary transmission.
+    try:
+        ser.dtr = True
+        ser.rts = True
+    except (OSError, serial.SerialException) as exc:
+        print(f"[DAQ] Warning: could not assert DTR/RTS: {exc}", flush=True)
+
+    # Explicit session handshake with Pico firmware v6+.
+    #
+    # X: stop any previous session (useful after an unclean host disconnect)
+    # reset_input_buffer(): discard binary bytes from that previous session
+    # S: reset Pico queues/FIFO/counters and begin a fresh stream
     time.sleep(max(0.0, args.startup_delay))
-    ser.reset_input_buffer()
+
+    try:
+        ser.write(b"X")
+        ser.flush()
+        time.sleep(0.05)
+        ser.reset_input_buffer()
+
+        ser.write(b"S")
+        ser.flush()
+    except (OSError, serial.SerialException) as exc:
+        print(f"[DAQ] Could not complete Pico START handshake: {exc}", file=sys.stderr)
+        ser.close()
+        return 2
+
+    print("[DAQ] Pico acquisition START command sent.")
 
     imu_outlets: Dict[int, StreamOutlet] = {}
     if not args.no_imu:
@@ -755,6 +779,7 @@ def main() -> int:
 
     last_diag = time.monotonic()
     last_valid_frame = time.monotonic()
+    last_bytes_received = 0
 
     def publish_pending_sample(sample: PendingSample) -> None:
         ts_lsl = clock_mapper.pico_to_lsl(sample.pico_us)
@@ -917,6 +942,10 @@ def main() -> int:
                 ppg_n = ppg_count
                 ppg_count = 0
 
+                bytes_now = serial_reader.bytes_received
+                bytes_delta = bytes_now - last_bytes_received
+                last_bytes_received = bytes_now
+
                 print(
                     f"[LSL] "
                     f"ACC={acc_n:3d}({acc_n / elapsed:6.1f}Hz) "
@@ -929,6 +958,7 @@ def main() -> int:
                     f"PPGring={ppg_ring_overflow} "
                     f"depth={ppg_current_queue_depth}/{ppg_max_queue_depth} "
                     f"FIFOovf={ppg_fifo_overflow} | "
+                    f"rx={bytes_delta / elapsed / 1000.0:5.1f}kB/s "
                     f"CRC={serial_reader.parser.crc_errors} "
                     f"USBdrops={usb_sequence.dropped} "
                     f"PPGdrops={ppg_sample_sequence.dropped} "
@@ -968,6 +998,15 @@ def main() -> int:
         serial_reader.join(timeout=1.0)
 
         try:
+            # Stop transmission and leave the Pico servicing sensors without
+            # accumulating pre-recording queues.
+            ser.write(b"X")
+            ser.flush()
+            time.sleep(0.02)
+        except Exception:
+            pass
+
+        try:
             ser.close()
         except Exception:
             pass
@@ -999,3 +1038,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
