@@ -280,16 +280,20 @@ def make_digital_pin(board: Any, digitalio: Any, pin_name: Optional[str], label:
     normalized = str(pin_name).strip().upper().replace("BOARD.", "").replace("PIN", "")
     physical_pin_map = {
         "11": "D17",
-        "GPIO0": "D17",  # WiringPi GPIO0 is physical pin 11 / BCM17.
+        "16": "D23",
+        "18": "D24",
         "22": "D25",
         "24": "CE0",
         "26": "CE1",
+        "29": "D5",
+        "31": "D6",
+        "GPIO0": "D17",  # WiringPi GPIO0 is physical pin 11 / BCM17.
     }
     attr_name = physical_pin_map.get(normalized, normalized)
     if attr_name.isdigit():
         attr_name = f"D{attr_name}"
     if not hasattr(board, attr_name):
-        raise ValueError(f"Unknown {label} {pin_name!r}; use a Blinka pin name like D17, D25, CE0, or CE1")
+        raise ValueError(f"Unknown {label} {pin_name!r}; use a Blinka pin name like D5, D6, D23, or D24")
     return digitalio.DigitalInOut(getattr(board, attr_name))
 
 
@@ -370,91 +374,39 @@ def create_bno085_spi(
     BNO08X_SPI: Any,
     cs_pin_name: str,
     int_pin_name: str,
+    wake_pin_name: str,
     reset_pin_name: str,
     spi_baudrate: int,
     debug: bool,
     attempts: int = 5,
 ) -> Any:
     if not cs_pin_name:
-        raise ValueError("BNO085 SPI requires a chip-select pin, e.g. CE0")
+        raise ValueError("BNO085 SPI requires a GPIO chip-select pin, e.g. D5")
     if not int_pin_name:
-        raise ValueError("BNO085 SPI requires the BNO INT pin connected to a GPIO, e.g. D25")
+        raise ValueError("BNO085 SPI requires the BNO INT pin connected to a GPIO, e.g. D23")
+    if not wake_pin_name:
+        raise ValueError("BNO085 SPI requires PS0/WAKE connected to a GPIO, e.g. D6")
     if not reset_pin_name:
-        raise ValueError("BNO085 SPI requires the BNO RESET pin connected to a GPIO, e.g. D17")
+        raise ValueError("BNO085 SPI requires the BNO RESET pin connected to a GPIO, e.g. D24")
 
-    bno08x_module = sys.modules.get("adafruit_bno08x")
-    packet_error_type = getattr(bno08x_module, "PacketError", RuntimeError)
-    packet_type = getattr(bno08x_module, "Packet", None)
-    if packet_type is None:
-        raise RuntimeError("Installed adafruit_bno08x package does not expose Packet")
-
-    class ResilientBNO08XSPI(BNO08X_SPI):
-        """Work around malformed/continued boot headers in the upstream SPI driver."""
-
-        def _read_packet(self):
-            # Read a complete maximum-size SHTP transfer under one CS assertion.
-            # Splitting the four-byte header and payload into separate Linux
-            # spidev transactions causes the BNO085 to fragment every packet.
-            transfer_size = 512
-            if len(self._data_buffer) < transfer_size:
-                self._data_buffer = bytearray(transfer_size)
-            self._wait_for_int()
-            with self._spi as spi:
-                spi.readinto(self._data_buffer, end=transfer_size, write_value=0x00)
-
-            is_continuation = bool(self._data_buffer[1] & 0x80)
-            header = packet_type.header_from_buffer(self._data_buffer)
-            packet_byte_count = header.packet_byte_count
-            channel_number = header.channel_number
-
-            if packet_byte_count == 0:
-                raise packet_error_type("No packet available")
-            if packet_byte_count < 4 or packet_byte_count > transfer_size:
-                raise packet_error_type(
-                    f"Invalid BNO085 SPI packet length: {packet_byte_count}"
-                )
-            if channel_number >= len(self._sequence_number):
-                raise packet_error_type(
-                    f"Invalid BNO085 SPI channel: {channel_number}"
-                )
-            if is_continuation:
-                raise packet_error_type("BNO085 SPI continuation segment discarded")
-
-            new_packet = packet_type(self._data_buffer)
-            if self._debug:
-                print(new_packet)
-            self._update_sequence_number(new_packet)
-            return new_packet
-
-        def hard_reset(self):
-            try:
-                return super().hard_reset()
-            except packet_error_type as exc:
-                message = str(exc)
-                if any(
-                    recoverable in message
-                    for recoverable in (
-                        "read partial packet",
-                        "No packet available",
-                        "Invalid BNO085 SPI packet header",
-                        "BNO085 SPI continuation segment discarded",
-                    )
-                ):
-                    print(
-                        f"BNO085 SPI boot packet skipped: {message}; continuing initialization",
-                        file=sys.stderr,
-                    )
-                    return None
-                raise
+    normalized_cs = str(cs_pin_name).strip().upper().replace("BOARD.", "")
+    if normalized_cs in {"CE0", "CE1", "D7", "D8", "GPIO7", "GPIO8", "24", "26"}:
+        raise ValueError(
+            "Do not connect BNO085 CS to Raspberry Pi CE0/CE1 with default Blinka SPI; "
+            "use a separate GPIO such as D5 and leave CE0/CE1 unconnected."
+        )
 
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
         cs_pin = make_digital_pin(board, digitalio, cs_pin_name, "SPI CS pin")
         int_pin = make_digital_pin(board, digitalio, int_pin_name, "SPI INT pin")
+        wake_pin = make_digital_pin(board, digitalio, wake_pin_name, "SPI WAKE pin")
         reset_pin = make_reset_pin(board, digitalio, reset_pin_name)
         try:
-            return ResilientBNO08XSPI(
+            # PS0 is sampled high with PS1 during reset to select SPI mode.
+            wake_pin.switch_to_output(value=True)
+            bno = BNO08X_SPI(
                 spi,
                 cs_pin,
                 int_pin,
@@ -462,12 +414,15 @@ def create_bno085_spi(
                 baudrate=spi_baudrate,
                 debug=debug,
             )
+            bno._nhmrc_wake_pin = wake_pin
+            return bno
         except Exception as exc:
             last_error = exc
-            try:
-                spi.deinit()
-            except Exception:
-                pass
+            for resource in (cs_pin, int_pin, wake_pin, reset_pin, spi):
+                try:
+                    resource.deinit()
+                except Exception:
+                    pass
             if attempt >= attempts:
                 raise
             print(f"BNO085 SPI init failed on attempt {attempt}/{attempts}: {exc}; retrying", file=sys.stderr)
@@ -536,11 +491,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--i2c-frequency", type=int, default=100000)
     parser.add_argument("--address", type=lambda x: int(x, 0), default=0x4A)
-    parser.add_argument("--spi-cs-pin", default="CE0", help="BNO085 SPI chip-select pin (default: CE0 / physical pin 24).")
-    parser.add_argument("--spi-int-pin", default=None, help="BNO085 SPI interrupt pin, e.g. D23 for physical pin 16.")
+    parser.add_argument("--spi-cs-pin", default="D5", help="BNO085 GPIO chip-select pin (default: D5 / physical pin 29).")
+    parser.add_argument("--spi-int-pin", default="D23", help="BNO085 SPI interrupt pin (default: D23 / physical pin 16).")
+    parser.add_argument("--spi-wake-pin", default="D6", help="BNO085 PS0/WAKE pin (default: D6 / physical pin 31).")
     parser.add_argument("--spi-baudrate", type=int, default=1000000, help="BNO085 SPI clock rate in Hz (default: 1000000).")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--reset-pin", default=None, help="Optional BNO085 reset pin, e.g. D17 for physical pin 11.")
+    parser.add_argument("--reset-pin", default=None, help="BNO085 reset pin; SPI requires D24 / physical pin 18 with the documented wiring.")
     parser.add_argument(
         "--reports",
         nargs="+",
@@ -571,6 +527,7 @@ def main() -> int:
             BNO08X_SPI,
             cs_pin_name=args.spi_cs_pin,
             int_pin_name=args.spi_int_pin,
+            wake_pin_name=args.spi_wake_pin,
             reset_pin_name=args.reset_pin,
             spi_baudrate=args.spi_baudrate,
             debug=args.debug,

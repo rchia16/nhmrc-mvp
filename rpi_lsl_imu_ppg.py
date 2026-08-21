@@ -96,6 +96,7 @@ class BNO085LSLIMUPublisher:
         transport: str,
         spi_cs_pin: str,
         spi_int_pin: str,
+        spi_wake_pin: str,
         spi_baudrate: int,
         debug: bool,
         reset_pin: Optional[str],
@@ -111,6 +112,7 @@ class BNO085LSLIMUPublisher:
         self.transport = str(transport).strip().lower()
         self.spi_cs_pin = spi_cs_pin
         self.spi_int_pin = spi_int_pin
+        self.spi_wake_pin = spi_wake_pin
         self.spi_baudrate = int(spi_baudrate)
         self.debug = bool(debug)
         self.io_lock = I2C_LOCK if self.transport == "i2c" else threading.Lock()
@@ -140,6 +142,7 @@ class BNO085LSLIMUPublisher:
                     BNO08X_SPI,
                     cs_pin_name=self.spi_cs_pin,
                     int_pin_name=self.spi_int_pin,
+                    wake_pin_name=self.spi_wake_pin,
                     reset_pin_name=self.reset_pin_name,
                     spi_baudrate=self.spi_baudrate,
                     debug=self.debug,
@@ -195,7 +198,7 @@ class BNO085LSLIMUPublisher:
         info = StreamInfo(self.name, "IMU", len(self.channel_names), self.poll_hz, "double64", self.source_id)
         _append_channels(info, self.channel_names)
         info.desc().append_child_value("clock", "sample channel 0 is UTC Unix seconds")
-        info.desc().append_child_value("sensor", "BNO085/BNO08x over Raspberry Pi I2C")
+        info.desc().append_child_value("sensor", f"BNO085/BNO08x over Raspberry Pi {self.transport.upper()}")
         reports_meta = info.desc().append_child("reports")
         for report in enabled_reports:
             reports_meta.append_child_value("report", report.name)
@@ -325,6 +328,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--bno-transport", choices=("i2c", "spi"), default=None)
     ap.add_argument("--bno-spi-cs-pin", default=None)
     ap.add_argument("--bno-spi-int-pin", default=None)
+    ap.add_argument("--bno-spi-wake-pin", default=None)
     ap.add_argument("--bno-spi-baudrate", type=int, default=None)
     ap.add_argument("--bno-debug", action="store_true")
     ap.add_argument("--bno-reset-pin", default=None)
@@ -354,8 +358,9 @@ def main() -> None:
     bno_address = args.bno_address if args.bno_address is not None else int(deep_get(cfg, "bno085.address", 0x4A))
     bno_i2c_frequency = args.bno_i2c_frequency or int(deep_get(cfg, "bno085.i2c_frequency", 100000))
     bno_transport = args.bno_transport or str(deep_get(cfg, "bno085.transport", "i2c")).lower()
-    bno_spi_cs_pin = args.bno_spi_cs_pin or deep_get(cfg, "bno085.spi.cs_pin", "CE0")
-    bno_spi_int_pin = args.bno_spi_int_pin or deep_get(cfg, "bno085.spi.int_pin", None)
+    bno_spi_cs_pin = args.bno_spi_cs_pin or deep_get(cfg, "bno085.spi.cs_pin", "D5")
+    bno_spi_int_pin = args.bno_spi_int_pin or deep_get(cfg, "bno085.spi.int_pin", "D23")
+    bno_spi_wake_pin = args.bno_spi_wake_pin or deep_get(cfg, "bno085.spi.wake_pin", "D6")
     bno_spi_baudrate = args.bno_spi_baudrate or int(deep_get(cfg, "bno085.spi.baudrate", 1000000))
     bno_debug = bool(args.bno_debug or deep_get(cfg, "bno085.debug", False))
     bno_reset_pin = args.bno_reset_pin or deep_get(cfg, "bno085.reset_pin", None)
@@ -378,7 +383,7 @@ def main() -> None:
         f"[LSL] Config: imu_stream={imu_stream_name} ppg_stream={ppg_stream_name} "
         f"imu_poll_hz={imu_poll_hz:g} reports={','.join(str(r) for r in bno_reports)} "
         f"bno_transport={bno_transport} bno_addr=0x{bno_address:02x} i2c_frequency={bno_i2c_frequency} "
-        f"spi_cs={bno_spi_cs_pin or 'none'} spi_int={bno_spi_int_pin or 'none'} spi_baudrate={bno_spi_baudrate} reset_pin={bno_reset_pin or 'none'} "
+        f"spi_cs={bno_spi_cs_pin or 'none'} spi_int={bno_spi_int_pin or 'none'} spi_wake={bno_spi_wake_pin or 'none'} spi_baudrate={bno_spi_baudrate} reset_pin={bno_reset_pin or 'none'} "
         f"imu_enabled={imu_enabled} ppg_enabled={ppg_enabled} rate_print={rate_print} diagnostics={diagnostics}",
         flush=True,
     )
@@ -402,6 +407,7 @@ def main() -> None:
         transport=bno_transport,
         spi_cs_pin=bno_spi_cs_pin,
         spi_int_pin=bno_spi_int_pin,
+        spi_wake_pin=bno_spi_wake_pin,
         spi_baudrate=bno_spi_baudrate,
         debug=bno_debug,
         reset_pin=bno_reset_pin,
