@@ -90,6 +90,7 @@ class BNO085LSLIMUPublisher:
         self.channel_names: tuple[str, ...] = ()
         self.outlet: Optional[StreamOutlet] = None
         self.rate = RateCounter("IMU", enabled=rate_print)
+        self.ready = threading.Event()
         self.bno = None
 
     def start(self) -> None:
@@ -97,16 +98,20 @@ class BNO085LSLIMUPublisher:
 
         enabled_reports: list[ReportSpec] = []
         with I2C_LOCK:
-            i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
-            for attempt in range(1, 4):
+            for attempt in range(1, 6):
+                i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
                 try:
                     self.bno = BNO08X_I2C(i2c, address=self.address, debug=self.debug)
                     break
                 except Exception as e:
-                    if attempt >= 3:
+                    try:
+                        i2c.deinit()
+                    except Exception:
+                        pass
+                    if attempt >= 5:
                         raise
-                    print(f"[LSL][IMU] BNO085 init failed on attempt {attempt}/3: {e}; retrying")
-                    time.sleep(0.5)
+                    print(f"[LSL][IMU] BNO085 init failed on attempt {attempt}/5: {e}; retrying")
+                    time.sleep(0.75)
 
             for report in selected_reports(self.report_names):
                 feature_id = getattr(bno08x, report.feature_const, None)
@@ -137,6 +142,7 @@ class BNO085LSLIMUPublisher:
             reports_meta.append_child_value("report", report.name)
 
         self.outlet = StreamOutlet(info)
+        self.ready.set()
         print(
             f"[LSL][IMU] Outlet ready: BNO085 reports={','.join(report.name for report in enabled_reports)} "
             f"rate={self.poll_hz:g}Hz"
@@ -307,9 +313,11 @@ def main() -> None:
         threading.Thread(target=_run_publisher, args=("PPG", ppg_pub), daemon=True),
     ]
     threads[0].start()
-    time.sleep(1.0)
-    if not stop_evt.is_set():
+    if imu_pub.ready.wait(timeout=8.0) and not stop_evt.is_set():
         threads[1].start()
+    elif not stop_evt.is_set():
+        print("[LSL] IMU did not become ready; not starting PPG on the shared I2C bus.")
+        stop_evt.set()
 
     print("[LSL] Streaming BNO085 IMU and PPG. Press Ctrl+C to stop.")
     try:
