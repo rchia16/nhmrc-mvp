@@ -384,15 +384,51 @@ def create_bno085_spi(
 
     bno08x_module = sys.modules.get("adafruit_bno08x")
     packet_error_type = getattr(bno08x_module, "PacketError", RuntimeError)
+    packet_type = getattr(bno08x_module, "Packet", None)
+    if packet_type is None:
+        raise RuntimeError("Installed adafruit_bno08x package does not expose Packet")
 
     class ResilientBNO08XSPI(BNO08X_SPI):
         """Work around malformed/continued boot headers in the upstream SPI driver."""
 
         def _read_packet(self):
-            try:
-                return super()._read_packet()
-            except IndexError as exc:
-                raise packet_error_type("Invalid BNO085 SPI packet header") from exc
+            self._read_header()
+            header = packet_type.header_from_buffer(self._data_buffer)
+            packet_byte_count = header.packet_byte_count
+            channel_number = header.channel_number
+
+            if packet_byte_count == 0:
+                raise packet_error_type("No packet available")
+            if packet_byte_count < 4 or packet_byte_count > 4096:
+                raise packet_error_type(
+                    f"Invalid BNO085 SPI packet length: {packet_byte_count}"
+                )
+            if channel_number >= len(self._sequence_number):
+                raise packet_error_type(
+                    f"Invalid BNO085 SPI channel: {channel_number}"
+                )
+
+            if packet_byte_count > len(self._data_buffer):
+                self._data_buffer = bytearray(packet_byte_count)
+
+            # A four-byte header-only SPI transaction sets the SHTP continuation
+            # bit. Re-read the complete packet and parse that transaction instead.
+            self._read_into(self._data_buffer, start=0, end=packet_byte_count)
+            complete_header = packet_type.header_from_buffer(self._data_buffer)
+            if complete_header.packet_byte_count != packet_byte_count:
+                raise packet_error_type(
+                    "BNO085 SPI packet length changed while reading"
+                )
+            if complete_header.channel_number >= len(self._sequence_number):
+                raise packet_error_type(
+                    f"Invalid BNO085 SPI channel: {complete_header.channel_number}"
+                )
+
+            new_packet = packet_type(self._data_buffer)
+            if self._debug:
+                print(new_packet)
+            self._update_sequence_number(new_packet)
+            return new_packet
 
         def hard_reset(self):
             try:
