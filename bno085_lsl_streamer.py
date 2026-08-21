@@ -392,14 +392,24 @@ def create_bno085_spi(
         """Work around malformed/continued boot headers in the upstream SPI driver."""
 
         def _read_packet(self):
-            self._read_header()
+            # Read a complete maximum-size SHTP transfer under one CS assertion.
+            # Splitting the four-byte header and payload into separate Linux
+            # spidev transactions causes the BNO085 to fragment every packet.
+            transfer_size = 512
+            if len(self._data_buffer) < transfer_size:
+                self._data_buffer = bytearray(transfer_size)
+            self._wait_for_int()
+            with self._spi as spi:
+                spi.readinto(self._data_buffer, end=transfer_size, write_value=0x00)
+
+            is_continuation = bool(self._data_buffer[1] & 0x80)
             header = packet_type.header_from_buffer(self._data_buffer)
             packet_byte_count = header.packet_byte_count
             channel_number = header.channel_number
 
             if packet_byte_count == 0:
                 raise packet_error_type("No packet available")
-            if packet_byte_count < 4 or packet_byte_count > 4096:
+            if packet_byte_count < 4 or packet_byte_count > transfer_size:
                 raise packet_error_type(
                     f"Invalid BNO085 SPI packet length: {packet_byte_count}"
                 )
@@ -407,22 +417,8 @@ def create_bno085_spi(
                 raise packet_error_type(
                     f"Invalid BNO085 SPI channel: {channel_number}"
                 )
-
-            if packet_byte_count > len(self._data_buffer):
-                self._data_buffer = bytearray(packet_byte_count)
-
-            # A four-byte header-only SPI transaction sets the SHTP continuation
-            # bit. Re-read the complete packet and parse that transaction instead.
-            self._read_into(self._data_buffer, start=0, end=packet_byte_count)
-            complete_header = packet_type.header_from_buffer(self._data_buffer)
-            if complete_header.packet_byte_count != packet_byte_count:
-                raise packet_error_type(
-                    "BNO085 SPI packet length changed while reading"
-                )
-            if complete_header.channel_number >= len(self._sequence_number):
-                raise packet_error_type(
-                    f"Invalid BNO085 SPI channel: {complete_header.channel_number}"
-                )
+            if is_continuation:
+                raise packet_error_type("BNO085 SPI continuation segment discarded")
 
             new_packet = packet_type(self._data_buffer)
             if self._debug:
@@ -441,6 +437,7 @@ def create_bno085_spi(
                         "read partial packet",
                         "No packet available",
                         "Invalid BNO085 SPI packet header",
+                        "BNO085 SPI continuation segment discarded",
                     )
                 ):
                     print(
