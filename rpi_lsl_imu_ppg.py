@@ -23,7 +23,6 @@ from typing import Iterable, Optional
 from bno085_lsl_streamer import ReportSpec, max_enabled_report_rate_hz, require_modules, selected_reports
 import max30102
 from pylsl import StreamInfo, StreamOutlet, local_clock
-from RPi import GPIO
 
 from config import deep_get, load_config
 
@@ -176,7 +175,7 @@ class LSLPPGPublisher:
         self.sensor: Optional[max30102.MAX30102] = None
 
     def start(self) -> None:
-        self.sensor = max30102.MAX30102()
+        self.sensor = max30102.MAX30102(gpio_pin=None)
         self.sensor.setup(
             led_mode=0x03,
             sample_rate=200,
@@ -189,10 +188,6 @@ class LSLPPGPublisher:
         print("[LSL][PPG] Outlet ready: MAX30102 red/IR")
 
     def stop(self) -> None:
-        try:
-            GPIO.cleanup()
-        except Exception:
-            pass
         self.sensor = None
 
     def run(self, stop_evt: threading.Event) -> None:

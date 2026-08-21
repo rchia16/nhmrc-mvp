@@ -59,10 +59,11 @@ class MAX30102():
         self.bus = SMBus(self.channel)
         self.interrupt = gpio_pin
 
-        # set gpio mode
-        GPIO.setmode(GPIO.BOARD)
-        # GPIO.setup(INT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        GPIO.setup(self.interrupt, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        # The polling reader drains FIFO over I2C and does not need the INT GPIO.
+        # Leave GPIO untouched when gpio_pin is None so Blinka/BNO085 can own GPIO mode.
+        if self.interrupt is not None:
+            GPIO.setmode(GPIO.BOARD)
+            GPIO.setup(self.interrupt, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
         self.reset()
 
