@@ -396,6 +396,61 @@ def create_bno085_spi(
             "use a separate GPIO such as D5 and leave CE0/CE1 unconnected."
         )
 
+    class BNO08XSPIContinuousCS(BNO08X_SPI):
+        """Read each SHTP packet while keeping the logical GPIO CS asserted."""
+
+        def _read_packet(self):
+            from adafruit_bno08x import DATA_BUFFER_SIZE, Packet, PacketError
+
+            self._wait_for_int()
+
+            # SPIDevice keeps the configured GPIO CS low for this whole block.
+            with self._spi as spi:
+                spi.readinto(
+                    self._data_buffer,
+                    start=0,
+                    end=4,
+                    write_value=0x00,
+                )
+
+                raw_length = self._data_buffer[0] | (self._data_buffer[1] << 8)
+                continuation = bool(raw_length & 0x8000)
+                packet_length = raw_length & 0x7FFF
+                channel = self._data_buffer[2]
+
+                if packet_length == 0:
+                    raise PacketError("No packet available")
+                if packet_length < 4:
+                    raise PacketError(f"Invalid SHTP packet length {packet_length}")
+                if packet_length > 4096:
+                    raise PacketError(f"Implausible SHTP packet length {packet_length}")
+                if channel >= len(self._sequence_number):
+                    raise PacketError(f"Invalid SHTP channel {channel}")
+
+                if packet_length > len(self._data_buffer):
+                    header = bytes(self._data_buffer[:4])
+                    self._data_buffer = bytearray(max(packet_length, DATA_BUFFER_SIZE))
+                    self._data_buffer[:4] = header
+
+                if packet_length > 4:
+                    spi.readinto(
+                        self._data_buffer,
+                        start=4,
+                        end=packet_length,
+                        write_value=0x00,
+                    )
+
+            if continuation:
+                raise PacketError(
+                    "Unexpected continuation at beginning of complete SPI transaction"
+                )
+
+            packet = Packet(self._data_buffer)
+            if self._debug:
+                print(packet)
+            self._update_sequence_number(packet)
+            return packet
+
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
@@ -406,7 +461,7 @@ def create_bno085_spi(
         try:
             # PS0 is sampled high with PS1 during reset to select SPI mode.
             wake_pin.switch_to_output(value=True)
-            bno = BNO08X_SPI(
+            bno = BNO08XSPIContinuousCS(
                 spi,
                 cs_pin,
                 int_pin,
