@@ -141,16 +141,23 @@ class BNO085LSLIMUPublisher:
                     print(f"[LSL][IMU] skipping {report.name}: missing {report.feature_const}", flush=True)
                     continue
                 try:
+                    requested_interval_us = max(report.default_interval_us, int(1_000_000 / max(1.0, self.poll_hz)))
                     self.diag.log(
-                        f"enabling {report.name} interval_us={report.default_interval_us}",
+                        f"enabling {report.name} interval_us={requested_interval_us}",
                         key=f"enable_{report.name}",
                         force=True,
                     )
-                    self.bno.enable_feature(feature_id, report.default_interval_us)
+                    self.bno.enable_feature(feature_id, requested_interval_us)
                 except Exception as e:
                     print(f"[LSL][IMU] skipping {report.name}: could not enable report: {e}", flush=True)
                     continue
                 enabled_reports.append(report)
+                configured_hz = 1_000_000.0 / float(requested_interval_us)
+                print(
+                    f"[LSL][IMU] Set {report.name} rate: {configured_hz:g} Hz "
+                    f"(interval_us={requested_interval_us})",
+                    flush=True,
+                )
                 self.diag.log(f"enabled {report.name}", key=f"enabled_{report.name}", force=True)
 
         if not enabled_reports:
@@ -237,9 +244,11 @@ class LSLPPGPublisher:
             self.diag.log("acquired I2C lock during MAX30102 init", force=True)
             self.sensor = max30102.MAX30102(gpio_pin=None)
             self.diag.log("MAX30102 object created; running setup", force=True)
+            ppg_sensor_rate_hz = 200
+            print(f"[LSL][PPG] Set MAX30102 sample rate: {ppg_sensor_rate_hz:g} Hz", flush=True)
             self.sensor.setup(
                 led_mode=0x03,
-                sample_rate=200,
+                sample_rate=ppg_sensor_rate_hz,
                 pulse_width=118,
                 adc_range=4096,
                 fifo_average=1,
