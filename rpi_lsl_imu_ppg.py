@@ -3,7 +3,7 @@
 Publish only IMU and PPG data to Lab Streaming Layer.
 
 Streams:
-  NHMRC_IMU: utc_unix_s, accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z
+  NHMRC_IMU: utc_unix_s plus configurable BNO085 9-DoF channels
   NHMRC_PPG: utc_unix_s, red, ir
 
 The LSL timestamp is set from pylsl.local_clock(); each sample also carries an
@@ -20,13 +20,12 @@ import time
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+from bno085_lsl_streamer import ReportSpec, max_enabled_report_rate_hz, require_modules, selected_reports
 import max30102
-import pyrealsense2 as rs
 from pylsl import StreamInfo, StreamOutlet, local_clock
 from RPi import GPIO
 
 from config import deep_get, load_config
-from imu_reader import IMUReader
 
 
 @dataclass
@@ -58,77 +57,106 @@ def _append_channels(info: StreamInfo, labels: Iterable[str]) -> None:
         channels.append_child("channel").append_child_value("label", str(label))
 
 
-class LSLIMUPublisher:
-    CHANNELS = (
-        "utc_unix_s",
-        "accel_x",
-        "accel_y",
-        "accel_z",
-        "gyro_x",
-        "gyro_y",
-        "gyro_z",
+class BNO085LSLIMUPublisher:
+    DEFAULT_REPORTS = (
+        "accelerometer",
+        "gyroscope",
+        "magnetometer",
+        "rotation_vector",
     )
 
-    def __init__(self, name: str, source_id: str, accel_hz: int, gyro_hz: int, poll_hz: float, rate_print: bool):
-        info = StreamInfo(name, "IMU", len(self.CHANNELS), 0.0, "float64", source_id)
-        _append_channels(info, self.CHANNELS)
-        info.desc().append_child_value("clock", "sample channel 0 is UTC Unix seconds")
-
-        self.outlet = StreamOutlet(info)
-        self.accel_hz = int(accel_hz)
-        self.gyro_hz = int(gyro_hz)
+    def __init__(
+        self,
+        name: str,
+        source_id: str,
+        poll_hz: float,
+        reports: Iterable[str],
+        address: int,
+        i2c_frequency: int,
+        debug: bool,
+        rate_print: bool,
+    ):
+        self.name = name
+        self.source_id = source_id
         self.poll_hz = float(poll_hz)
+        self.report_names = tuple(reports)
+        self.address = int(address)
+        self.i2c_frequency = int(i2c_frequency)
+        self.debug = bool(debug)
+        self.reports: list[ReportSpec] = []
+        self.channel_names: tuple[str, ...] = ()
+        self.outlet: Optional[StreamOutlet] = None
         self.rate = RateCounter("IMU", enabled=rate_print)
-        self.reader: Optional[IMUReader] = None
-        self._last_accel_seq = -1
-        self._last_gyro_seq = -1
+        self.bno = None
 
     def start(self) -> None:
-        ctx = rs.context()
-        devices = ctx.query_devices()
-        if len(devices) < 1:
-            raise RuntimeError("No RealSense device found for IMU streaming.")
-        self.reader = IMUReader(devices[0], accel_hz=self.accel_hz, gyro_hz=self.gyro_hz)
-        print(f"[LSL][IMU] Outlet ready: accel@{self.accel_hz}Hz gyro@{self.gyro_hz}Hz")
+        board, busio, BNO08X_I2C, bno08x, _, _, _ = require_modules()
+        i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
+        self.bno = BNO08X_I2C(i2c, address=self.address, debug=self.debug)
+
+        enabled_reports: list[ReportSpec] = []
+        for report in selected_reports(self.report_names):
+            feature_id = getattr(bno08x, report.feature_const, None)
+            if feature_id is None:
+                print(f"[LSL][IMU] skipping {report.name}: missing {report.feature_const}")
+                continue
+            try:
+                self.bno.enable_feature(feature_id, report.default_interval_us)
+            except Exception as e:
+                print(f"[LSL][IMU] skipping {report.name}: could not enable report: {e}")
+                continue
+            enabled_reports.append(report)
+
+        if not enabled_reports:
+            raise RuntimeError("No BNO085 reports were enabled for IMU streaming.")
+
+        self.reports = enabled_reports
+        self.channel_names = tuple(
+            ["utc_unix_s", *[name for report in enabled_reports for name in report.channel_names]]
+        )
+
+        info = StreamInfo(self.name, "IMU", len(self.channel_names), self.poll_hz, "float64", self.source_id)
+        _append_channels(info, self.channel_names)
+        info.desc().append_child_value("clock", "sample channel 0 is UTC Unix seconds")
+        info.desc().append_child_value("sensor", "BNO085/BNO08x over Raspberry Pi I2C")
+        reports_meta = info.desc().append_child("reports")
+        for report in enabled_reports:
+            reports_meta.append_child_value("report", report.name)
+
+        self.outlet = StreamOutlet(info)
+        print(
+            f"[LSL][IMU] Outlet ready: BNO085 reports={','.join(report.name for report in enabled_reports)} "
+            f"rate={self.poll_hz:g}Hz"
+        )
 
     def stop(self) -> None:
-        if self.reader is not None:
-            self.reader.stop()
-            self.reader = None
+        self.bno = None
 
     def run(self, stop_evt: threading.Event) -> None:
         self.start()
-        sleep_s = 1.0 / max(1.0, self.poll_hz)
+        period_s = 1.0 / max(1.0, self.poll_hz)
+        next_sample_time = time.monotonic()
         try:
             while not stop_evt.is_set():
-                sample = self.reader.get_latest_timestamped() if self.reader is not None else None
-                if sample is None:
-                    time.sleep(sleep_s)
-                    continue
+                row = [time.time()]
+                for report in self.reports:
+                    try:
+                        value = getattr(self.bno, report.property_name) if self.bno is not None else None
+                        row.extend(report.converter(value))
+                    except Exception as e:
+                        print(f"[LSL][IMU] read failed for {report.name}: {e}")
+                        row.extend([math.nan] * len(report.channel_names))
 
-                accel_seq = int(sample["accel_seq"])
-                gyro_seq = int(sample["gyro_seq"])
-                if accel_seq == self._last_accel_seq and gyro_seq == self._last_gyro_seq:
-                    time.sleep(sleep_s)
-                    continue
-
-                accel = sample["accel"]
-                gyro = sample["gyro"]
-                utc = max(
-                    float(sample["accel_utc"] or 0.0),
-                    float(sample["gyro_utc"] or 0.0),
-                ) or time.time()
-
-                row = [
-                    utc,
-                    *(accel if accel is not None else (math.nan, math.nan, math.nan)),
-                    *(gyro if gyro is not None else (math.nan, math.nan, math.nan)),
-                ]
-                self.outlet.push_sample(row, timestamp=local_clock())
-                self._last_accel_seq = accel_seq
-                self._last_gyro_seq = gyro_seq
+                if self.outlet is not None:
+                    self.outlet.push_sample(row, timestamp=local_clock())
                 self.rate.add()
-                time.sleep(sleep_s)
+
+                next_sample_time += period_s
+                sleep_s = next_sample_time - time.monotonic()
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                else:
+                    next_sample_time = time.monotonic()
         finally:
             self.stop()
 
@@ -196,8 +224,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--ppg-stream-name", default=None)
     ap.add_argument("--source-id-prefix", default=None)
     ap.add_argument("--imu-poll-hz", type=float, default=None)
-    ap.add_argument("--accel-hz", type=int, default=None)
-    ap.add_argument("--gyro-hz", type=int, default=None)
+    ap.add_argument("--bno-address", type=lambda x: int(x, 0), default=None)
+    ap.add_argument("--bno-i2c-frequency", type=int, default=None)
+    ap.add_argument("--bno-debug", action="store_true")
+    ap.add_argument("--bno-reports", nargs="+", default=None)
     ap.add_argument("--ppg-poll-sleep-ms", type=float, default=None)
     ap.add_argument("--ppg-sample-rate-hz", type=float, default=None)
     ap.add_argument("--rate-print", action="store_true")
@@ -211,9 +241,17 @@ def main() -> None:
     imu_stream_name = args.imu_stream_name or deep_get(cfg, "lsl.imu_stream_name", "NHMRC_IMU")
     ppg_stream_name = args.ppg_stream_name or deep_get(cfg, "lsl.ppg_stream_name", "NHMRC_PPG")
     source_id_prefix = args.source_id_prefix or deep_get(cfg, "lsl.source_id_prefix", "nhmrc")
-    imu_poll_hz = args.imu_poll_hz or float(deep_get(cfg, "lsl.imu_poll_hz", 500.0))
-    accel_hz = args.accel_hz or int(deep_get(cfg, "lsl.accel_hz", 250))
-    gyro_hz = args.gyro_hz or int(deep_get(cfg, "lsl.gyro_hz", 400))
+    imu_poll_hz = args.imu_poll_hz
+    if imu_poll_hz is None:
+        configured_imu_poll_hz = deep_get(cfg, "lsl.imu_poll_hz", None)
+        if configured_imu_poll_hz is not None:
+            imu_poll_hz = float(configured_imu_poll_hz)
+    bno_address = args.bno_address if args.bno_address is not None else int(deep_get(cfg, "bno085.address", 0x4A))
+    bno_i2c_frequency = args.bno_i2c_frequency or int(deep_get(cfg, "bno085.i2c_frequency", 400000))
+    bno_debug = bool(args.bno_debug or deep_get(cfg, "bno085.debug", False))
+    bno_reports = args.bno_reports or deep_get(cfg, "bno085.reports", BNO085LSLIMUPublisher.DEFAULT_REPORTS)
+    if imu_poll_hz is None:
+        imu_poll_hz = max_enabled_report_rate_hz(selected_reports(bno_reports))
     ppg_poll_sleep_ms = args.ppg_poll_sleep_ms or float(deep_get(cfg, "ppg.poll_sleep_ms", 5.0))
     ppg_sample_rate_hz = args.ppg_sample_rate_hz or float(deep_get(cfg, "lsl.ppg_sample_rate_hz", 200.0))
     rate_print = bool(args.rate_print or deep_get(cfg, "lsl.rate_print", False))
@@ -226,12 +264,14 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
-    imu_pub = LSLIMUPublisher(
+    imu_pub = BNO085LSLIMUPublisher(
         name=imu_stream_name,
         source_id=f"{source_id_prefix}_imu",
-        accel_hz=accel_hz,
-        gyro_hz=gyro_hz,
         poll_hz=imu_poll_hz,
+        reports=bno_reports,
+        address=bno_address,
+        i2c_frequency=bno_i2c_frequency,
+        debug=bno_debug,
         rate_print=rate_print,
     )
     ppg_pub = LSLPPGPublisher(
@@ -256,7 +296,7 @@ def main() -> None:
     for thread in threads:
         thread.start()
 
-    print("[LSL] Streaming only IMU and PPG. Press Ctrl+C to stop.")
+    print("[LSL] Streaming BNO085 IMU and PPG. Press Ctrl+C to stop.")
     try:
         while not stop_evt.is_set():
             time.sleep(0.5)

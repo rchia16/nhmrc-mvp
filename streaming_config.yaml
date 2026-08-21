@@ -20,6 +20,16 @@ realsense:
   rs_timeout_ms: 200
   max_inflight: 8
 
+bno085:
+  address: 0x4A
+  i2c_frequency: 400000
+  debug: false
+  reports:
+    - accelerometer
+    - gyroscope
+    - magnetometer
+    - rotation_vector
+
 ppg:
   log_dir: "logs/"
   rotate_seconds: 3600
@@ -31,12 +41,9 @@ ppg:
   pc_poll_hz: 500.0
 
 lsl:
-  imu_stream_name: "RPI_IMU"
+  imu_stream_name: "RPI_9DOF"
   ppg_stream_name: "RPI_PPG"
   source_id_prefix: "nhmrc"
-  accel_hz: 250
-  gyro_hz: 400
-  imu_poll_hz: 500.0
   ppg_sample_rate_hz: 200.0
   rate_print: true
 
@@ -90,4 +97,3 @@ sonification:
     chair: "./sound-lib/mixkit-arcade-mechanical-bling-210.wav"
     door:  "./sound-lib/mixkit-unlock-game-notification-253.wav"
     object: "./sound-lib/Shortzz.mp3"
-
