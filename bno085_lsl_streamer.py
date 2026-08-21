@@ -382,6 +382,38 @@ def create_bno085_spi(
     if not reset_pin_name:
         raise ValueError("BNO085 SPI requires the BNO RESET pin connected to a GPIO, e.g. D17")
 
+    bno08x_module = sys.modules.get("adafruit_bno08x")
+    packet_error_type = getattr(bno08x_module, "PacketError", RuntimeError)
+
+    class ResilientBNO08XSPI(BNO08X_SPI):
+        """Work around malformed/continued boot headers in the upstream SPI driver."""
+
+        def _read_packet(self):
+            try:
+                return super()._read_packet()
+            except IndexError as exc:
+                raise packet_error_type("Invalid BNO085 SPI packet header") from exc
+
+        def hard_reset(self):
+            try:
+                return super().hard_reset()
+            except packet_error_type as exc:
+                message = str(exc)
+                if any(
+                    recoverable in message
+                    for recoverable in (
+                        "read partial packet",
+                        "No packet available",
+                        "Invalid BNO085 SPI packet header",
+                    )
+                ):
+                    print(
+                        f"BNO085 SPI boot packet skipped: {message}; continuing initialization",
+                        file=sys.stderr,
+                    )
+                    return None
+                raise
+
     last_error: Optional[Exception] = None
     for attempt in range(1, attempts + 1):
         spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
@@ -389,8 +421,14 @@ def create_bno085_spi(
         int_pin = make_digital_pin(board, digitalio, int_pin_name, "SPI INT pin")
         reset_pin = make_reset_pin(board, digitalio, reset_pin_name)
         try:
-            pulse_reset_pin(reset_pin)
-            return BNO08X_SPI(spi, cs_pin, int_pin, reset_pin, baudrate=spi_baudrate, debug=debug)
+            return ResilientBNO08XSPI(
+                spi,
+                cs_pin,
+                int_pin,
+                reset_pin,
+                baudrate=spi_baudrate,
+                debug=debug,
+            )
         except Exception as exc:
             last_error = exc
             try:
