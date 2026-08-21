@@ -289,6 +289,18 @@ def make_reset_pin(board: Any, digitalio: Any, pin_name: Optional[str]) -> Any:
         raise ValueError(f"Unknown reset pin {pin_name!r}; use a Blinka pin name like D17")
     return digitalio.DigitalInOut(getattr(board, attr_name))
 
+
+
+def pulse_reset_pin(reset_pin: Any, hold_s: float = 0.05, boot_s: float = 0.75) -> None:
+    if reset_pin is None:
+        return
+    reset_pin.switch_to_output(value=True)
+    time.sleep(0.01)
+    reset_pin.value = False
+    time.sleep(hold_s)
+    reset_pin.value = True
+    time.sleep(boot_s)
+
 def require_modules():
     try:
         import board
@@ -306,6 +318,41 @@ def require_modules():
 
     return board, busio, digitalio, BNO08X_I2C, bno08x, StreamInfo, StreamOutlet, local_clock
 
+
+
+
+def create_bno085_i2c(
+    board: Any,
+    busio: Any,
+    digitalio: Any,
+    BNO08X_I2C: Any,
+    address: int,
+    i2c_frequency: int,
+    reset_pin_name: Optional[str],
+    debug: bool,
+    attempts: int = 5,
+) -> Any:
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        i2c = busio.I2C(board.SCL, board.SDA, frequency=i2c_frequency)
+        reset_pin = make_reset_pin(board, digitalio, reset_pin_name)
+        try:
+            pulse_reset_pin(reset_pin)
+            return BNO08X_I2C(i2c, address=address, reset=reset_pin, debug=debug)
+        except Exception as exc:
+            last_error = exc
+            try:
+                i2c.deinit()
+            except Exception:
+                pass
+            if attempt >= attempts:
+                raise
+            print(f"BNO085 init failed on attempt {attempt}/{attempts}: {exc}; retrying", file=sys.stderr)
+            time.sleep(0.75)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("BNO085 init failed")
 
 def add_lsl_metadata(info: Any, channel_names: list[str], enabled_names: list[str]) -> None:
     info.desc().append_child_value("manufacturer", "Bosch/Sense BNO085 via Adafruit BNO08x")
@@ -383,9 +430,16 @@ def main() -> int:
 
     board, busio, digitalio, BNO08X_I2C, bno08x, StreamInfo, StreamOutlet, local_clock = require_modules()
 
-    i2c = busio.I2C(board.SCL, board.SDA, frequency=args.i2c_frequency)
-    reset_pin = make_reset_pin(board, digitalio, args.reset_pin)
-    bno = BNO08X_I2C(i2c, address=args.address, reset=reset_pin, debug=args.debug)
+    bno = create_bno085_i2c(
+        board,
+        busio,
+        digitalio,
+        BNO08X_I2C,
+        address=args.address,
+        i2c_frequency=args.i2c_frequency,
+        reset_pin_name=args.reset_pin,
+        debug=args.debug,
+    )
 
     enabled_reports: list[ReportSpec] = []
     for report in reports:

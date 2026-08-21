@@ -21,7 +21,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from bno085_lsl_streamer import ReportSpec, make_reset_pin, max_enabled_report_rate_hz, require_modules, selected_reports
+from bno085_lsl_streamer import ReportSpec, create_bno085_i2c, max_enabled_report_rate_hz, require_modules, selected_reports
 import max30102
 from pylsl import StreamInfo, StreamOutlet, local_clock
 
@@ -100,21 +100,16 @@ class BNO085LSLIMUPublisher:
 
         enabled_reports: list[ReportSpec] = []
         with I2C_LOCK:
-            for attempt in range(1, 6):
-                i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
-                try:
-                    reset_pin = make_reset_pin(board, digitalio, self.reset_pin_name)
-                    self.bno = BNO08X_I2C(i2c, address=self.address, reset=reset_pin, debug=self.debug)
-                    break
-                except Exception as e:
-                    try:
-                        i2c.deinit()
-                    except Exception:
-                        pass
-                    if attempt >= 5:
-                        raise
-                    print(f"[LSL][IMU] BNO085 init failed on attempt {attempt}/5: {e}; retrying")
-                    time.sleep(0.75)
+            self.bno = create_bno085_i2c(
+                board,
+                busio,
+                digitalio,
+                BNO08X_I2C,
+                address=self.address,
+                i2c_frequency=self.i2c_frequency,
+                reset_pin_name=self.reset_pin_name,
+                debug=self.debug,
+            )
 
             for report in selected_reports(self.report_names):
                 feature_id = getattr(bno08x, report.feature_const, None)
