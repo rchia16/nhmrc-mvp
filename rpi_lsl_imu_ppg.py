@@ -21,7 +21,7 @@ import traceback
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from bno085_lsl_streamer import ReportSpec, max_enabled_report_rate_hz, require_modules, selected_reports
+from bno085_lsl_streamer import ReportSpec, make_reset_pin, max_enabled_report_rate_hz, require_modules, selected_reports
 import max30102
 from pylsl import StreamInfo, StreamOutlet, local_clock
 
@@ -77,6 +77,7 @@ class BNO085LSLIMUPublisher:
         address: int,
         i2c_frequency: int,
         debug: bool,
+        reset_pin: Optional[str],
         rate_print: bool,
     ):
         self.name = name
@@ -86,6 +87,7 @@ class BNO085LSLIMUPublisher:
         self.address = int(address)
         self.i2c_frequency = int(i2c_frequency)
         self.debug = bool(debug)
+        self.reset_pin_name = reset_pin
         self.reports: list[ReportSpec] = []
         self.channel_names: tuple[str, ...] = ()
         self.outlet: Optional[StreamOutlet] = None
@@ -94,14 +96,15 @@ class BNO085LSLIMUPublisher:
         self.bno = None
 
     def start(self) -> None:
-        board, busio, BNO08X_I2C, bno08x, _, _, _ = require_modules()
+        board, busio, digitalio, BNO08X_I2C, bno08x, _, _, _ = require_modules()
 
         enabled_reports: list[ReportSpec] = []
         with I2C_LOCK:
             for attempt in range(1, 6):
                 i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
                 try:
-                    self.bno = BNO08X_I2C(i2c, address=self.address, debug=self.debug)
+                    reset_pin = make_reset_pin(board, digitalio, self.reset_pin_name)
+                    self.bno = BNO08X_I2C(i2c, address=self.address, reset=reset_pin, debug=self.debug)
                     break
                 except Exception as e:
                     try:
@@ -245,6 +248,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--bno-address", type=lambda x: int(x, 0), default=None)
     ap.add_argument("--bno-i2c-frequency", type=int, default=None)
     ap.add_argument("--bno-debug", action="store_true")
+    ap.add_argument("--bno-reset-pin", default=None)
     ap.add_argument("--bno-reports", nargs="+", default=None)
     ap.add_argument("--ppg-poll-sleep-ms", type=float, default=None)
     ap.add_argument("--ppg-sample-rate-hz", type=float, default=None)
@@ -265,8 +269,9 @@ def main() -> None:
         if configured_imu_poll_hz is not None:
             imu_poll_hz = float(configured_imu_poll_hz)
     bno_address = args.bno_address if args.bno_address is not None else int(deep_get(cfg, "bno085.address", 0x4A))
-    bno_i2c_frequency = args.bno_i2c_frequency or int(deep_get(cfg, "bno085.i2c_frequency", 400000))
+    bno_i2c_frequency = args.bno_i2c_frequency or int(deep_get(cfg, "bno085.i2c_frequency", 100000))
     bno_debug = bool(args.bno_debug or deep_get(cfg, "bno085.debug", False))
+    bno_reset_pin = args.bno_reset_pin or deep_get(cfg, "bno085.reset_pin", None)
     bno_reports = args.bno_reports or deep_get(cfg, "bno085.reports", BNO085LSLIMUPublisher.DEFAULT_REPORTS)
     if imu_poll_hz is None:
         imu_poll_hz = max_enabled_report_rate_hz(selected_reports(bno_reports))
@@ -290,6 +295,7 @@ def main() -> None:
         address=bno_address,
         i2c_frequency=bno_i2c_frequency,
         debug=bno_debug,
+        reset_pin=bno_reset_pin,
         rate_print=rate_print,
     )
     ppg_pub = LSLPPGPublisher(
@@ -326,7 +332,8 @@ def main() -> None:
     finally:
         stop_evt.set()
         for thread in threads:
-            thread.join(timeout=2.0)
+            if thread.ident is not None:
+                thread.join(timeout=2.0)
         print("[LSL] Stopped.")
 
 

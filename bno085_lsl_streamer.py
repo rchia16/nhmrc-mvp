@@ -271,10 +271,29 @@ def selected_reports(names: Iterable[str]) -> list[ReportSpec]:
     return reports
 
 
+
+
+def make_reset_pin(board: Any, digitalio: Any, pin_name: Optional[str]) -> Any:
+    if not pin_name:
+        return None
+
+    normalized = str(pin_name).strip().upper().replace("BOARD.", "").replace("PIN", "")
+    physical_pin_map = {
+        "11": "D17",
+        "GPIO0": "D17",  # WiringPi GPIO0 is physical pin 11 / BCM17.
+    }
+    attr_name = physical_pin_map.get(normalized, normalized)
+    if attr_name.isdigit():
+        attr_name = f"D{attr_name}"
+    if not hasattr(board, attr_name):
+        raise ValueError(f"Unknown reset pin {pin_name!r}; use a Blinka pin name like D17")
+    return digitalio.DigitalInOut(getattr(board, attr_name))
+
 def require_modules():
     try:
         import board
         import busio
+        import digitalio
         from adafruit_bno08x.i2c import BNO08X_I2C
         import adafruit_bno08x as bno08x
         from pylsl import StreamInfo, StreamOutlet, local_clock
@@ -285,7 +304,7 @@ def require_modules():
             f"Import error: {exc}"
         ) from exc
 
-    return board, busio, BNO08X_I2C, bno08x, StreamInfo, StreamOutlet, local_clock
+    return board, busio, digitalio, BNO08X_I2C, bno08x, StreamInfo, StreamOutlet, local_clock
 
 
 def add_lsl_metadata(info: Any, channel_names: list[str], enabled_names: list[str]) -> None:
@@ -338,13 +357,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream-type", default="IMU")
     parser.add_argument("--source-id", default="bno085_rpi_i2c")
     parser.add_argument("--rate-hz", type=float, default=None, help="LSL output rate. Defaults to the fastest enabled report rate.")
-    parser.add_argument("--i2c-frequency", type=int, default=400000)
+    parser.add_argument("--i2c-frequency", type=int, default=100000)
     parser.add_argument("--address", type=lambda x: int(x, 0), default=0x4A)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--reset-pin", default=None, help="Optional BNO085 reset pin, e.g. D17 for physical pin 11.")
     parser.add_argument(
         "--reports",
         nargs="+",
-        default=["all"],
+        default=["accelerometer", "gyroscope", "magnetometer", "rotation_vector"],
         help="Report groups to stream, or 'all'.",
     )
     parser.add_argument("--csv", default=None, help="Optional CSV mirror path.")
@@ -361,10 +381,11 @@ def main() -> int:
         raise SystemExit("--rate-hz must be positive")
     channel_names = [name for report in reports for name in report.channel_names]
 
-    board, busio, BNO08X_I2C, bno08x, StreamInfo, StreamOutlet, local_clock = require_modules()
+    board, busio, digitalio, BNO08X_I2C, bno08x, StreamInfo, StreamOutlet, local_clock = require_modules()
 
     i2c = busio.I2C(board.SCL, board.SDA, frequency=args.i2c_frequency)
-    bno = BNO08X_I2C(i2c, address=args.address, debug=args.debug)
+    reset_pin = make_reset_pin(board, digitalio, args.reset_pin)
+    bno = BNO08X_I2C(i2c, address=args.address, reset=reset_pin, debug=args.debug)
 
     enabled_reports: list[ReportSpec] = []
     for report in reports:
