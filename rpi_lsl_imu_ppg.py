@@ -247,6 +247,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--bno-reports", nargs="+", default=None)
     ap.add_argument("--ppg-poll-sleep-ms", type=float, default=None)
     ap.add_argument("--ppg-sample-rate-hz", type=float, default=None)
+    ap.add_argument("--imu-ready-timeout-s", type=float, default=None)
     ap.add_argument("--rate-print", action="store_true")
     return ap
 
@@ -272,6 +273,9 @@ def main() -> None:
         imu_poll_hz = max_enabled_report_rate_hz(selected_reports(bno_reports))
     ppg_poll_sleep_ms = args.ppg_poll_sleep_ms or float(deep_get(cfg, "ppg.poll_sleep_ms", 5.0))
     ppg_sample_rate_hz = args.ppg_sample_rate_hz or float(deep_get(cfg, "lsl.ppg_sample_rate_hz", 200.0))
+    imu_ready_timeout_s = args.imu_ready_timeout_s
+    if imu_ready_timeout_s is None:
+        imu_ready_timeout_s = float(deep_get(cfg, "lsl.imu_ready_timeout_s", 30.0))
     rate_print = bool(args.rate_print or deep_get(cfg, "lsl.rate_print", False))
 
     stop_evt = threading.Event()
@@ -314,10 +318,13 @@ def main() -> None:
         threading.Thread(target=_run_publisher, args=("PPG", ppg_pub), daemon=True),
     ]
     threads[0].start()
-    if imu_pub.ready.wait(timeout=8.0) and not stop_evt.is_set():
+    if imu_pub.ready.wait(timeout=max(0.0, imu_ready_timeout_s)) and not stop_evt.is_set():
         threads[1].start()
     elif not stop_evt.is_set():
-        print("[LSL] IMU did not become ready; not starting PPG on the shared I2C bus.")
+        print(
+            f"[LSL] IMU did not become ready within {imu_ready_timeout_s:g}s; "
+            "not starting PPG on the shared I2C bus."
+        )
         stop_evt.set()
 
     print("[LSL] Streaming BNO085 IMU and PPG. Press Ctrl+C to stop.")
