@@ -399,6 +399,90 @@ def create_bno085_spi(
     class BNO08XSPIContinuousCS(BNO08X_SPI):
         """Read each SHTP packet while keeping the logical GPIO CS asserted."""
 
+        def __init__(
+            self,
+            spi_bus,
+            cspin,
+            intpin,
+            resetpin,
+            wakepin,
+            baudrate=1000000,
+            debug=False,
+        ):
+            # The base constructor initializes immediately, so WAKE must already exist.
+            self._nhmrc_wake_pin = wakepin
+            super().__init__(
+                spi_bus,
+                cspin,
+                intpin,
+                resetpin,
+                baudrate=baudrate,
+                debug=debug,
+            )
+
+        def _wait_for_int(self, timeout=0.5):
+            from adafruit_bno08x import PacketError
+
+            start = time.monotonic()
+            while self._int.value:
+                if time.monotonic() - start >= timeout:
+                    raise PacketError("BNO085 INT timeout")
+                time.sleep(0.0005)
+
+        @property
+        def _data_ready(self):
+            return not self._int.value
+
+        def soft_reset(self):
+            """Drain boot packets that arrive without resetting on an idle bus."""
+            from adafruit_bno08x import PacketError
+
+            idle_since = time.monotonic()
+            overall_deadline = time.monotonic() + 0.5
+
+            while time.monotonic() < overall_deadline:
+                if self._data_ready:
+                    try:
+                        self._read_packet()
+                    except PacketError:
+                        pass
+                    idle_since = time.monotonic()
+                    continue
+
+                if time.monotonic() - idle_since >= 0.05:
+                    break
+                time.sleep(0.001)
+
+        def _send_packet(self, channel, data):
+            from struct import pack_into
+
+            data_length = len(data)
+            write_length = data_length + 4
+
+            pack_into("<H", self._data_buffer, 0, write_length)
+            self._data_buffer[2] = channel
+            self._data_buffer[3] = self._sequence_number[channel]
+            for idx, send_byte in enumerate(data):
+                self._data_buffer[4 + idx] = send_byte
+
+            # PS0 becomes active-low WAKE after boot.
+            self._nhmrc_wake_pin.value = False
+            try:
+                self._wait_for_int(timeout=0.5)
+                with self._spi as spi:
+                    spi.write(self._data_buffer, end=write_length)
+            finally:
+                self._nhmrc_wake_pin.value = True
+
+            self._dbg(
+                "Sending: ",
+                [hex(x) for x in self._data_buffer[0:write_length]],
+            )
+            self._sequence_number[channel] = (
+                self._sequence_number[channel] + 1
+            ) % 256
+            return self._sequence_number[channel]
+
         def _read_packet(self):
             from adafruit_bno08x import DATA_BUFFER_SIZE, Packet, PacketError
 
@@ -466,10 +550,10 @@ def create_bno085_spi(
                 cs_pin,
                 int_pin,
                 reset_pin,
+                wake_pin,
                 baudrate=spi_baudrate,
                 debug=debug,
             )
-            bno._nhmrc_wake_pin = wake_pin
             return bno
         except Exception as exc:
             last_error = exc
