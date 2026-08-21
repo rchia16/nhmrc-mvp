@@ -273,7 +273,7 @@ def selected_reports(names: Iterable[str]) -> list[ReportSpec]:
 
 
 
-def make_reset_pin(board: Any, digitalio: Any, pin_name: Optional[str]) -> Any:
+def make_digital_pin(board: Any, digitalio: Any, pin_name: Optional[str], label: str = "pin") -> Any:
     if not pin_name:
         return None
 
@@ -281,13 +281,20 @@ def make_reset_pin(board: Any, digitalio: Any, pin_name: Optional[str]) -> Any:
     physical_pin_map = {
         "11": "D17",
         "GPIO0": "D17",  # WiringPi GPIO0 is physical pin 11 / BCM17.
+        "22": "D25",
+        "24": "CE0",
+        "26": "CE1",
     }
     attr_name = physical_pin_map.get(normalized, normalized)
     if attr_name.isdigit():
         attr_name = f"D{attr_name}"
     if not hasattr(board, attr_name):
-        raise ValueError(f"Unknown reset pin {pin_name!r}; use a Blinka pin name like D17")
+        raise ValueError(f"Unknown {label} {pin_name!r}; use a Blinka pin name like D17, D25, CE0, or CE1")
     return digitalio.DigitalInOut(getattr(board, attr_name))
+
+
+def make_reset_pin(board: Any, digitalio: Any, pin_name: Optional[str]) -> Any:
+    return make_digital_pin(board, digitalio, pin_name, "reset pin")
 
 
 
@@ -316,7 +323,7 @@ def require_modules():
             f"Import error: {exc}"
         ) from exc
 
-    return board, busio, digitalio, BNO08X_I2C, bno08x, StreamInfo, StreamOutlet, local_clock
+    return board, busio, digitalio, BNO08X_I2C, BNO08X_SPI, bno08x, StreamInfo, StreamOutlet, local_clock
 
 
 
@@ -354,9 +361,54 @@ def create_bno085_i2c(
         raise last_error
     raise RuntimeError("BNO085 init failed")
 
+
+def create_bno085_spi(
+    board: Any,
+    busio: Any,
+    digitalio: Any,
+    BNO08X_SPI: Any,
+    cs_pin_name: str,
+    int_pin_name: str,
+    reset_pin_name: str,
+    spi_baudrate: int,
+    debug: bool,
+    attempts: int = 5,
+) -> Any:
+    if not cs_pin_name:
+        raise ValueError("BNO085 SPI requires a chip-select pin, e.g. CE0")
+    if not int_pin_name:
+        raise ValueError("BNO085 SPI requires the BNO INT pin connected to a GPIO, e.g. D25")
+    if not reset_pin_name:
+        raise ValueError("BNO085 SPI requires the BNO RESET pin connected to a GPIO, e.g. D17")
+
+    last_error: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        spi = busio.SPI(board.SCK, board.MOSI, board.MISO)
+        cs_pin = make_digital_pin(board, digitalio, cs_pin_name, "SPI CS pin")
+        int_pin = make_digital_pin(board, digitalio, int_pin_name, "SPI INT pin")
+        reset_pin = make_reset_pin(board, digitalio, reset_pin_name)
+        try:
+            pulse_reset_pin(reset_pin)
+            return BNO08X_SPI(spi, cs_pin, int_pin, reset_pin, baudrate=spi_baudrate, debug=debug)
+        except Exception as exc:
+            last_error = exc
+            try:
+                spi.deinit()
+            except Exception:
+                pass
+            if attempt >= attempts:
+                raise
+            print(f"BNO085 SPI init failed on attempt {attempt}/{attempts}: {exc}; retrying", file=sys.stderr)
+            time.sleep(0.75)
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("BNO085 SPI init failed")
+
+
 def add_lsl_metadata(info: Any, channel_names: list[str], enabled_names: list[str]) -> None:
     info.desc().append_child_value("manufacturer", "Bosch/Sense BNO085 via Adafruit BNO08x")
-    info.desc().append_child_value("source", "Raspberry Pi I2C")
+    info.desc().append_child_value("source", "Raspberry Pi")
     reports = info.desc().append_child("reports")
     for name in enabled_names:
         reports.append_child_value("report", name)
@@ -398,11 +450,11 @@ def open_csv(path: Optional[str], channel_names: list[str]):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stream BNO085/BNO08x I2C IMU channels to Lab Streaming Layer."
+        description="Stream BNO085/BNO08x IMU channels to Lab Streaming Layer."
     )
     parser.add_argument("--stream-name", default="BNO085")
     parser.add_argument("--stream-type", default="IMU")
-    parser.add_argument("--source-id", default="bno085_rpi_i2c")
+    parser.add_argument("--source-id", default="bno085_rpi")
     parser.add_argument("--rate-hz", type=float, default=None, help="LSL output rate. Defaults to the fastest enabled report rate.")
     parser.add_argument("--i2c-frequency", type=int, default=100000)
     parser.add_argument("--address", type=lambda x: int(x, 0), default=0x4A)
@@ -428,7 +480,7 @@ def main() -> int:
         raise SystemExit("--rate-hz must be positive")
     channel_names = [name for report in reports for name in report.channel_names]
 
-    board, busio, digitalio, BNO08X_I2C, bno08x, StreamInfo, StreamOutlet, local_clock = require_modules()
+    board, busio, digitalio, BNO08X_I2C, BNO08X_SPI, bno08x, StreamInfo, StreamOutlet, local_clock = require_modules()
 
     bno = create_bno085_i2c(
         board,

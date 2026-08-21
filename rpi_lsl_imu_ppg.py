@@ -21,7 +21,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-from bno085_lsl_streamer import ReportSpec, create_bno085_i2c, max_enabled_report_rate_hz, require_modules, selected_reports
+from bno085_lsl_streamer import ReportSpec, create_bno085_i2c, create_bno085_spi, max_enabled_report_rate_hz, require_modules, selected_reports
 import max30102
 from pylsl import StreamInfo, StreamOutlet, local_clock
 
@@ -93,6 +93,10 @@ class BNO085LSLIMUPublisher:
         reports: Iterable[str],
         address: int,
         i2c_frequency: int,
+        transport: str,
+        spi_cs_pin: str,
+        spi_int_pin: str,
+        spi_baudrate: int,
         debug: bool,
         reset_pin: Optional[str],
         rate_print: bool,
@@ -104,7 +108,12 @@ class BNO085LSLIMUPublisher:
         self.report_names = tuple(reports)
         self.address = int(address)
         self.i2c_frequency = int(i2c_frequency)
+        self.transport = str(transport).strip().lower()
+        self.spi_cs_pin = spi_cs_pin
+        self.spi_int_pin = spi_int_pin
+        self.spi_baudrate = int(spi_baudrate)
         self.debug = bool(debug)
+        self.io_lock = I2C_LOCK if self.transport == "i2c" else threading.Lock()
         self.reset_pin_name = reset_pin
         self.reports: list[ReportSpec] = []
         self.channel_names: tuple[str, ...] = ()
@@ -116,23 +125,38 @@ class BNO085LSLIMUPublisher:
 
     def start(self) -> None:
         self.diag.log("loading hardware modules", force=True)
-        board, busio, digitalio, BNO08X_I2C, bno08x, _, _, _ = require_modules()
+        board, busio, digitalio, BNO08X_I2C, BNO08X_SPI, bno08x, _, _, _ = require_modules()
 
         enabled_reports: list[ReportSpec] = []
-        self.diag.log("waiting for I2C lock during BNO085 init", force=True)
-        with I2C_LOCK:
-            self.diag.log("acquired I2C lock during BNO085 init", force=True)
-            self.diag.log("creating BNO085 I2C object", force=True)
-            self.bno = create_bno085_i2c(
-                board,
-                busio,
-                digitalio,
-                BNO08X_I2C,
-                address=self.address,
-                i2c_frequency=self.i2c_frequency,
-                reset_pin_name=self.reset_pin_name,
-                debug=self.debug,
-            )
+        self.diag.log(f"waiting for {self.transport.upper()} lock during BNO085 init", force=True)
+        with self.io_lock:
+            self.diag.log(f"acquired {self.transport.upper()} lock during BNO085 init", force=True)
+            self.diag.log(f"creating BNO085 {self.transport.upper()} object", force=True)
+            if self.transport == "spi":
+                self.bno = create_bno085_spi(
+                    board,
+                    busio,
+                    digitalio,
+                    BNO08X_SPI,
+                    cs_pin_name=self.spi_cs_pin,
+                    int_pin_name=self.spi_int_pin,
+                    reset_pin_name=self.reset_pin_name,
+                    spi_baudrate=self.spi_baudrate,
+                    debug=self.debug,
+                )
+            elif self.transport == "i2c":
+                self.bno = create_bno085_i2c(
+                    board,
+                    busio,
+                    digitalio,
+                    BNO08X_I2C,
+                    address=self.address,
+                    i2c_frequency=self.i2c_frequency,
+                    reset_pin_name=self.reset_pin_name,
+                    debug=self.debug,
+                )
+            else:
+                raise ValueError(f"Unsupported BNO085 transport {self.transport!r}; use 'spi' or 'i2c'")
 
             self.diag.log("BNO085 object created; enabling reports", force=True)
             for report in selected_reports(self.report_names):
@@ -198,9 +222,9 @@ class BNO085LSLIMUPublisher:
                 row = [time.time()]
                 for report in self.reports:
                     try:
-                        self.diag.log(f"waiting for I2C lock to read {report.name}", key=f"wait_read_{report.name}")
-                        with I2C_LOCK:
-                            self.diag.log(f"acquired I2C lock; reading {report.name}", key=f"read_{report.name}")
+                        self.diag.log(f"waiting for {self.transport.upper()} lock to read {report.name}", key=f"wait_read_{report.name}")
+                        with self.io_lock:
+                            self.diag.log(f"acquired {self.transport.upper()} lock; reading {report.name}", key=f"read_{report.name}")
                             value = getattr(self.bno, report.property_name) if self.bno is not None else None
                         self.diag.log(f"read {report.name} value={value}", key=f"read_ok_{report.name}")
                         row.extend(report.converter(value))
@@ -298,6 +322,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--imu-poll-hz", type=float, default=None)
     ap.add_argument("--bno-address", type=lambda x: int(x, 0), default=None)
     ap.add_argument("--bno-i2c-frequency", type=int, default=None)
+    ap.add_argument("--bno-transport", choices=("i2c", "spi"), default=None)
+    ap.add_argument("--bno-spi-cs-pin", default=None)
+    ap.add_argument("--bno-spi-int-pin", default=None)
+    ap.add_argument("--bno-spi-baudrate", type=int, default=None)
     ap.add_argument("--bno-debug", action="store_true")
     ap.add_argument("--bno-reset-pin", default=None)
     ap.add_argument("--bno-reports", nargs="+", default=None)
@@ -325,6 +353,10 @@ def main() -> None:
             imu_poll_hz = float(configured_imu_poll_hz)
     bno_address = args.bno_address if args.bno_address is not None else int(deep_get(cfg, "bno085.address", 0x4A))
     bno_i2c_frequency = args.bno_i2c_frequency or int(deep_get(cfg, "bno085.i2c_frequency", 100000))
+    bno_transport = args.bno_transport or str(deep_get(cfg, "bno085.transport", "i2c")).lower()
+    bno_spi_cs_pin = args.bno_spi_cs_pin or deep_get(cfg, "bno085.spi.cs_pin", "CE0")
+    bno_spi_int_pin = args.bno_spi_int_pin or deep_get(cfg, "bno085.spi.int_pin", None)
+    bno_spi_baudrate = args.bno_spi_baudrate or int(deep_get(cfg, "bno085.spi.baudrate", 1000000))
     bno_debug = bool(args.bno_debug or deep_get(cfg, "bno085.debug", False))
     bno_reset_pin = args.bno_reset_pin or deep_get(cfg, "bno085.reset_pin", None)
     bno_reports = args.bno_reports or deep_get(cfg, "bno085.reports", BNO085LSLIMUPublisher.DEFAULT_REPORTS)
@@ -345,7 +377,8 @@ def main() -> None:
     print(
         f"[LSL] Config: imu_stream={imu_stream_name} ppg_stream={ppg_stream_name} "
         f"imu_poll_hz={imu_poll_hz:g} reports={','.join(str(r) for r in bno_reports)} "
-        f"bno_addr=0x{bno_address:02x} i2c_frequency={bno_i2c_frequency} reset_pin={bno_reset_pin or 'none'} "
+        f"bno_transport={bno_transport} bno_addr=0x{bno_address:02x} i2c_frequency={bno_i2c_frequency} "
+        f"spi_cs={bno_spi_cs_pin or 'none'} spi_int={bno_spi_int_pin or 'none'} spi_baudrate={bno_spi_baudrate} reset_pin={bno_reset_pin or 'none'} "
         f"imu_enabled={imu_enabled} ppg_enabled={ppg_enabled} rate_print={rate_print} diagnostics={diagnostics}",
         flush=True,
     )
@@ -366,6 +399,10 @@ def main() -> None:
         reports=bno_reports,
         address=bno_address,
         i2c_frequency=bno_i2c_frequency,
+        transport=bno_transport,
+        spi_cs_pin=bno_spi_cs_pin,
+        spi_int_pin=bno_spi_int_pin,
+        spi_baudrate=bno_spi_baudrate,
         debug=bno_debug,
         reset_pin=bno_reset_pin,
         rate_print=rate_print,

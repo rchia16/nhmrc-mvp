@@ -21,10 +21,15 @@ realsense:
   max_inflight: 8
 
 bno085:
+  transport: spi
   address: 0x4A
   i2c_frequency: 100000
+  spi:
+    cs_pin: CE0
+    int_pin: D23
+    baudrate: 1000000
   debug: false
-  reset_pin: D17
+  reset_pin: D24
   reports:
     - accelerometer
     - gyroscope
@@ -45,6 +50,7 @@ lsl:
   imu_stream_name: "RPI_9DOF"
   ppg_stream_name: "RPI_PPG"
   source_id_prefix: "nhmrc"
+  imu_poll_hz: 250.0
   ppg_sample_rate_hz: 200.0
   rate_print: true
 
