@@ -314,6 +314,7 @@ def require_modules():
         import busio
         import digitalio
         from adafruit_bno08x.i2c import BNO08X_I2C
+        from adafruit_bno08x.spi import BNO08X_SPI
         import adafruit_bno08x as bno08x
         from pylsl import StreamInfo, StreamOutlet, local_clock
     except ImportError as exc:
