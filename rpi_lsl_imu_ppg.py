@@ -115,7 +115,7 @@ class BNO085LSLIMUPublisher:
             ["utc_unix_s", *[name for report in enabled_reports for name in report.channel_names]]
         )
 
-        info = StreamInfo(self.name, "IMU", len(self.channel_names), self.poll_hz, "float64", self.source_id)
+        info = StreamInfo(self.name, "IMU", len(self.channel_names), self.poll_hz, "double64", self.source_id)
         _append_channels(info, self.channel_names)
         info.desc().append_child_value("clock", "sample channel 0 is UTC Unix seconds")
         info.desc().append_child_value("sensor", "BNO085/BNO08x over Raspberry Pi I2C")
@@ -166,7 +166,7 @@ class LSLPPGPublisher:
 
     def __init__(self, name: str, source_id: str, poll_sleep_ms: float, sample_rate_hz: float, rate_print: bool):
         self.sample_rate_hz = float(sample_rate_hz)
-        info = StreamInfo(name, "PPG", len(self.CHANNELS), self.sample_rate_hz, "float64", source_id)
+        info = StreamInfo(name, "PPG", len(self.CHANNELS), self.sample_rate_hz, "double64", source_id)
         _append_channels(info, self.CHANNELS)
         info.desc().append_child_value("clock", "sample channel 0 is UTC Unix seconds")
 
