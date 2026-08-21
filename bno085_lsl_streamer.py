@@ -457,8 +457,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream-type", default="IMU")
     parser.add_argument("--source-id", default="bno085_rpi")
     parser.add_argument("--rate-hz", type=float, default=None, help="LSL output rate. Defaults to the fastest enabled report rate.")
+    parser.add_argument(
+        "--transport",
+        choices=("i2c", "spi"),
+        default="i2c",
+        help="BNO085 bus transport (default: i2c).",
+    )
     parser.add_argument("--i2c-frequency", type=int, default=100000)
     parser.add_argument("--address", type=lambda x: int(x, 0), default=0x4A)
+    parser.add_argument("--spi-cs-pin", default="CE0", help="BNO085 SPI chip-select pin (default: CE0 / physical pin 24).")
+    parser.add_argument("--spi-int-pin", default=None, help="BNO085 SPI interrupt pin, e.g. D23 for physical pin 16.")
+    parser.add_argument("--spi-baudrate", type=int, default=1000000, help="BNO085 SPI clock rate in Hz (default: 1000000).")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--reset-pin", default=None, help="Optional BNO085 reset pin, e.g. D17 for physical pin 11.")
     parser.add_argument(
@@ -483,16 +492,29 @@ def main() -> int:
 
     board, busio, digitalio, BNO08X_I2C, BNO08X_SPI, bno08x, StreamInfo, StreamOutlet, local_clock = require_modules()
 
-    bno = create_bno085_i2c(
-        board,
-        busio,
-        digitalio,
-        BNO08X_I2C,
-        address=args.address,
-        i2c_frequency=args.i2c_frequency,
-        reset_pin_name=args.reset_pin,
-        debug=args.debug,
-    )
+    if args.transport == "spi":
+        bno = create_bno085_spi(
+            board,
+            busio,
+            digitalio,
+            BNO08X_SPI,
+            cs_pin_name=args.spi_cs_pin,
+            int_pin_name=args.spi_int_pin,
+            reset_pin_name=args.reset_pin,
+            spi_baudrate=args.spi_baudrate,
+            debug=args.debug,
+        )
+    else:
+        bno = create_bno085_i2c(
+            board,
+            busio,
+            digitalio,
+            BNO08X_I2C,
+            address=args.address,
+            i2c_frequency=args.i2c_frequency,
+            reset_pin_name=args.reset_pin,
+            debug=args.debug,
+        )
 
     enabled_reports: list[ReportSpec] = []
     for report in reports:
