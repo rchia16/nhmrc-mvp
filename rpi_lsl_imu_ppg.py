@@ -297,6 +297,8 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--imu-ready-timeout-s", type=float, default=None)
     ap.add_argument("--rate-print", action="store_true")
     ap.add_argument("--diagnostics", action="store_true")
+    ap.add_argument("--no-imu", action="store_true")
+    ap.add_argument("--no-ppg", action="store_true")
     return ap
 
 
@@ -326,12 +328,16 @@ def main() -> None:
         imu_ready_timeout_s = float(deep_get(cfg, "lsl.imu_ready_timeout_s", 30.0))
     rate_print = bool(args.rate_print or deep_get(cfg, "lsl.rate_print", False))
     diagnostics = bool(args.diagnostics or deep_get(cfg, "lsl.diagnostics", False))
+    imu_enabled = bool(deep_get(cfg, "streams.imu.enabled", True)) and not args.no_imu
+    ppg_enabled = bool(deep_get(cfg, "streams.ppg.enabled", True)) and not args.no_ppg
+    if not imu_enabled and not ppg_enabled:
+        raise SystemExit("No streams enabled. Remove --no-imu/--no-ppg or enable a stream in config.")
 
     print(
         f"[LSL] Config: imu_stream={imu_stream_name} ppg_stream={ppg_stream_name} "
         f"imu_poll_hz={imu_poll_hz:g} reports={','.join(str(r) for r in bno_reports)} "
         f"bno_addr=0x{bno_address:02x} i2c_frequency={bno_i2c_frequency} reset_pin={bno_reset_pin or 'none'} "
-        f"rate_print={rate_print} diagnostics={diagnostics}",
+        f"imu_enabled={imu_enabled} ppg_enabled={ppg_enabled} rate_print={rate_print} diagnostics={diagnostics}",
         flush=True,
     )
 
@@ -377,26 +383,34 @@ def main() -> None:
             traceback.print_exc()
             stop_evt.set()
 
-    threads = [
-        threading.Thread(target=_run_publisher, args=("IMU", imu_pub), daemon=True),
-        threading.Thread(target=_run_publisher, args=("PPG", ppg_pub), daemon=True),
-    ]
-    threads[0].start()
-    if diagnostics:
-        print(f"[LSL][DIAG][MAIN] waiting up to {imu_ready_timeout_s:g}s for IMU readiness", flush=True)
-    if imu_pub.ready.wait(timeout=max(0.0, imu_ready_timeout_s)) and not stop_evt.is_set():
-        if diagnostics:
-            print("[LSL][DIAG][MAIN] IMU ready; starting PPG thread", flush=True)
-        threads[1].start()
-    elif not stop_evt.is_set():
-        print(
-            f"[LSL] IMU did not become ready within {imu_ready_timeout_s:g}s; "
-            "not starting PPG on the shared I2C bus.",
-            flush=True,
-        )
-        stop_evt.set()
+    threads = []
+    imu_thread = threading.Thread(target=_run_publisher, args=("IMU", imu_pub), daemon=True, name="LSL-IMU")
+    ppg_thread = threading.Thread(target=_run_publisher, args=("PPG", ppg_pub), daemon=True, name="LSL-PPG")
 
-    print("[LSL] Streaming BNO085 IMU and PPG. Press Ctrl+C to stop.", flush=True)
+    if imu_enabled:
+        threads.append(imu_thread)
+        imu_thread.start()
+        if ppg_enabled:
+            if diagnostics:
+                print(f"[LSL][DIAG][MAIN] waiting up to {imu_ready_timeout_s:g}s for IMU readiness", flush=True)
+            if imu_pub.ready.wait(timeout=max(0.0, imu_ready_timeout_s)) and not stop_evt.is_set():
+                if diagnostics:
+                    print("[LSL][DIAG][MAIN] IMU ready; starting PPG thread", flush=True)
+                threads.append(ppg_thread)
+                ppg_thread.start()
+            elif not stop_evt.is_set():
+                print(
+                    f"[LSL] IMU did not become ready within {imu_ready_timeout_s:g}s; "
+                    "not starting PPG on the shared I2C bus.",
+                    flush=True,
+                )
+                stop_evt.set()
+    elif ppg_enabled:
+        threads.append(ppg_thread)
+        ppg_thread.start()
+
+    active = ", ".join(label for label, enabled in (("BNO085 IMU", imu_enabled), ("PPG", ppg_enabled)) if enabled)
+    print(f"[LSL] Streaming {active}. Press Ctrl+C to stop.", flush=True)
     try:
         while not stop_evt.is_set():
             time.sleep(0.5)
