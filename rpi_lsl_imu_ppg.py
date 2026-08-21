@@ -18,7 +18,7 @@ import signal
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from bno085_lsl_streamer import ReportSpec, create_bno085_i2c, max_enabled_report_rate_hz, require_modules, selected_reports
@@ -29,6 +29,23 @@ from config import deep_get, load_config
 
 
 I2C_LOCK = threading.Lock()
+
+
+@dataclass
+class DiagnosticLogger:
+    label: str
+    enabled: bool = False
+    interval_s: float = 2.0
+    _last_by_key: dict[str, float] = field(default_factory=dict, init=False)
+
+    def log(self, message: str, key: str = "default", force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = time.time()
+        last = self._last_by_key.get(key, 0.0)
+        if force or now - last >= self.interval_s:
+            print(f"[LSL][DIAG][{self.label}] {message}", flush=True)
+            self._last_by_key[key] = now
 
 
 @dataclass
@@ -49,7 +66,7 @@ class RateCounter:
         dt = now - self._t0
         if dt >= self.interval_s:
             rate = self._count / dt if dt > 0 else 0.0
-            print(f"[LSL][{self.label}] {rate:.1f} Hz ({self._count} samples / {dt:.2f} s)")
+            print(f"[LSL][{self.label}] {rate:.1f} Hz ({self._count} samples / {dt:.2f} s)", flush=True)
             self._count = 0
             self._t0 = now
 
@@ -79,6 +96,7 @@ class BNO085LSLIMUPublisher:
         debug: bool,
         reset_pin: Optional[str],
         rate_print: bool,
+        diagnostics: bool,
     ):
         self.name = name
         self.source_id = source_id
@@ -92,14 +110,19 @@ class BNO085LSLIMUPublisher:
         self.channel_names: tuple[str, ...] = ()
         self.outlet: Optional[StreamOutlet] = None
         self.rate = RateCounter("IMU", enabled=rate_print)
+        self.diag = DiagnosticLogger("IMU", enabled=diagnostics)
         self.ready = threading.Event()
         self.bno = None
 
     def start(self) -> None:
+        self.diag.log("loading hardware modules", force=True)
         board, busio, digitalio, BNO08X_I2C, bno08x, _, _, _ = require_modules()
 
         enabled_reports: list[ReportSpec] = []
+        self.diag.log("waiting for I2C lock during BNO085 init", force=True)
         with I2C_LOCK:
+            self.diag.log("acquired I2C lock during BNO085 init", force=True)
+            self.diag.log("creating BNO085 I2C object", force=True)
             self.bno = create_bno085_i2c(
                 board,
                 busio,
@@ -111,17 +134,24 @@ class BNO085LSLIMUPublisher:
                 debug=self.debug,
             )
 
+            self.diag.log("BNO085 object created; enabling reports", force=True)
             for report in selected_reports(self.report_names):
                 feature_id = getattr(bno08x, report.feature_const, None)
                 if feature_id is None:
-                    print(f"[LSL][IMU] skipping {report.name}: missing {report.feature_const}")
+                    print(f"[LSL][IMU] skipping {report.name}: missing {report.feature_const}", flush=True)
                     continue
                 try:
+                    self.diag.log(
+                        f"enabling {report.name} interval_us={report.default_interval_us}",
+                        key=f"enable_{report.name}",
+                        force=True,
+                    )
                     self.bno.enable_feature(feature_id, report.default_interval_us)
                 except Exception as e:
-                    print(f"[LSL][IMU] skipping {report.name}: could not enable report: {e}")
+                    print(f"[LSL][IMU] skipping {report.name}: could not enable report: {e}", flush=True)
                     continue
                 enabled_reports.append(report)
+                self.diag.log(f"enabled {report.name}", key=f"enabled_{report.name}", force=True)
 
         if not enabled_reports:
             raise RuntimeError("No BNO085 reports were enabled for IMU streaming.")
@@ -139,11 +169,13 @@ class BNO085LSLIMUPublisher:
         for report in enabled_reports:
             reports_meta.append_child_value("report", report.name)
 
+        self.diag.log("creating IMU LSL outlet", force=True)
         self.outlet = StreamOutlet(info)
         self.ready.set()
         print(
             f"[LSL][IMU] Outlet ready: BNO085 reports={','.join(report.name for report in enabled_reports)} "
-            f"rate={self.poll_hz:g}Hz"
+            f"rate={self.poll_hz:g}Hz",
+            flush=True,
         )
 
     def stop(self) -> None:
@@ -151,6 +183,7 @@ class BNO085LSLIMUPublisher:
 
     def run(self, stop_evt: threading.Event) -> None:
         self.start()
+        self.diag.log("entering IMU sample loop", force=True)
         period_s = 1.0 / max(1.0, self.poll_hz)
         next_sample_time = time.monotonic()
         try:
@@ -158,15 +191,19 @@ class BNO085LSLIMUPublisher:
                 row = [time.time()]
                 for report in self.reports:
                     try:
+                        self.diag.log(f"waiting for I2C lock to read {report.name}", key=f"wait_read_{report.name}")
                         with I2C_LOCK:
+                            self.diag.log(f"acquired I2C lock; reading {report.name}", key=f"read_{report.name}")
                             value = getattr(self.bno, report.property_name) if self.bno is not None else None
+                        self.diag.log(f"read {report.name} value={value}", key=f"read_ok_{report.name}")
                         row.extend(report.converter(value))
                     except Exception as e:
-                        print(f"[LSL][IMU] read failed for {report.name}: {e}")
+                        print(f"[LSL][IMU] read failed for {report.name}: {e}", flush=True)
                         row.extend([math.nan] * len(report.channel_names))
 
                 if self.outlet is not None:
                     self.outlet.push_sample(row, timestamp=local_clock())
+                    self.diag.log(f"pushed IMU sample len={len(row)}", key="push")
                 self.rate.add()
 
                 next_sample_time += period_s
@@ -182,7 +219,7 @@ class BNO085LSLIMUPublisher:
 class LSLPPGPublisher:
     CHANNELS = ("utc_unix_s", "red", "ir")
 
-    def __init__(self, name: str, source_id: str, poll_sleep_ms: float, sample_rate_hz: float, rate_print: bool):
+    def __init__(self, name: str, source_id: str, poll_sleep_ms: float, sample_rate_hz: float, rate_print: bool, diagnostics: bool):
         self.sample_rate_hz = float(sample_rate_hz)
         info = StreamInfo(name, "PPG", len(self.CHANNELS), self.sample_rate_hz, "double64", source_id)
         _append_channels(info, self.CHANNELS)
@@ -191,11 +228,15 @@ class LSLPPGPublisher:
         self.outlet = StreamOutlet(info)
         self.poll_sleep_ms = float(poll_sleep_ms)
         self.rate = RateCounter("PPG", enabled=rate_print)
+        self.diag = DiagnosticLogger("PPG", enabled=diagnostics)
         self.sensor: Optional[max30102.MAX30102] = None
 
     def start(self) -> None:
+        self.diag.log("waiting for I2C lock during MAX30102 init", force=True)
         with I2C_LOCK:
+            self.diag.log("acquired I2C lock during MAX30102 init", force=True)
             self.sensor = max30102.MAX30102(gpio_pin=None)
+            self.diag.log("MAX30102 object created; running setup", force=True)
             self.sensor.setup(
                 led_mode=0x03,
                 sample_rate=200,
@@ -205,27 +246,33 @@ class LSLPPGPublisher:
                 fifo_rollover=False,
                 fifo_a_full=15,
             )
-        print("[LSL][PPG] Outlet ready: MAX30102 red/IR")
+        self.diag.log("MAX30102 setup complete", force=True)
+        print("[LSL][PPG] Outlet ready: MAX30102 red/IR", flush=True)
 
     def stop(self) -> None:
         self.sensor = None
 
     def run(self, stop_evt: threading.Event) -> None:
         self.start()
+        self.diag.log("entering PPG sample loop", force=True)
         try:
             while not stop_evt.is_set():
                 batch = None
                 try:
+                    self.diag.log("waiting for I2C lock to read FIFO", key="wait_read")
                     with I2C_LOCK:
+                        self.diag.log("acquired I2C lock; reading FIFO", key="read")
                         batch = self.sensor.i2c_thread_func(max_batch=32, require_ppg_rdy=False) if self.sensor else None
+                    self.diag.log(f"FIFO read returned {len(batch) if batch else 0} samples", key="read_ok")
                 except Exception as e:
-                    print(f"[LSL][PPG] read error: {e}")
+                    print(f"[LSL][PPG] read error: {e}", flush=True)
 
                 if batch:
                     n = len(batch)
                     for i, (utc, red, ir) in enumerate(batch):
                         sample_utc = float(utc) - max(0, n - 1 - i) / max(1.0, self.sample_rate_hz)
                         self.outlet.push_sample([sample_utc, float(red), float(ir)], timestamp=local_clock())
+                    self.diag.log(f"pushed PPG batch n={n}", key="push")
                     self.rate.add(n)
 
                 time.sleep(self.poll_sleep_ms / 1000.0)
@@ -249,6 +296,7 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--ppg-sample-rate-hz", type=float, default=None)
     ap.add_argument("--imu-ready-timeout-s", type=float, default=None)
     ap.add_argument("--rate-print", action="store_true")
+    ap.add_argument("--diagnostics", action="store_true")
     return ap
 
 
@@ -277,10 +325,20 @@ def main() -> None:
     if imu_ready_timeout_s is None:
         imu_ready_timeout_s = float(deep_get(cfg, "lsl.imu_ready_timeout_s", 30.0))
     rate_print = bool(args.rate_print or deep_get(cfg, "lsl.rate_print", False))
+    diagnostics = bool(args.diagnostics or deep_get(cfg, "lsl.diagnostics", False))
+
+    print(
+        f"[LSL] Config: imu_stream={imu_stream_name} ppg_stream={ppg_stream_name} "
+        f"imu_poll_hz={imu_poll_hz:g} reports={','.join(str(r) for r in bno_reports)} "
+        f"bno_addr=0x{bno_address:02x} i2c_frequency={bno_i2c_frequency} reset_pin={bno_reset_pin or 'none'} "
+        f"rate_print={rate_print} diagnostics={diagnostics}",
+        flush=True,
+    )
 
     stop_evt = threading.Event()
 
     def _sig_handler(_sig, _frame):
+        print("[LSL] Stop requested; waiting for publisher threads to exit...", flush=True)
         stop_evt.set()
 
     signal.signal(signal.SIGINT, _sig_handler)
@@ -296,6 +354,7 @@ def main() -> None:
         debug=bno_debug,
         reset_pin=bno_reset_pin,
         rate_print=rate_print,
+        diagnostics=diagnostics,
     )
     ppg_pub = LSLPPGPublisher(
         name=ppg_stream_name,
@@ -303,13 +362,18 @@ def main() -> None:
         poll_sleep_ms=ppg_poll_sleep_ms,
         sample_rate_hz=ppg_sample_rate_hz,
         rate_print=rate_print,
+        diagnostics=diagnostics,
     )
 
     def _run_publisher(label, publisher):
         try:
+            if diagnostics:
+                print(f"[LSL][DIAG][{label}] publisher thread starting", flush=True)
             publisher.run(stop_evt)
+            if diagnostics:
+                print(f"[LSL][DIAG][{label}] publisher thread exited", flush=True)
         except Exception as e:
-            print(f"[LSL][{label}] fatal error: {e}")
+            print(f"[LSL][{label}] fatal error: {e}", flush=True)
             traceback.print_exc()
             stop_evt.set()
 
@@ -318,16 +382,21 @@ def main() -> None:
         threading.Thread(target=_run_publisher, args=("PPG", ppg_pub), daemon=True),
     ]
     threads[0].start()
+    if diagnostics:
+        print(f"[LSL][DIAG][MAIN] waiting up to {imu_ready_timeout_s:g}s for IMU readiness", flush=True)
     if imu_pub.ready.wait(timeout=max(0.0, imu_ready_timeout_s)) and not stop_evt.is_set():
+        if diagnostics:
+            print("[LSL][DIAG][MAIN] IMU ready; starting PPG thread", flush=True)
         threads[1].start()
     elif not stop_evt.is_set():
         print(
             f"[LSL] IMU did not become ready within {imu_ready_timeout_s:g}s; "
-            "not starting PPG on the shared I2C bus."
+            "not starting PPG on the shared I2C bus.",
+            flush=True,
         )
         stop_evt.set()
 
-    print("[LSL] Streaming BNO085 IMU and PPG. Press Ctrl+C to stop.")
+    print("[LSL] Streaming BNO085 IMU and PPG. Press Ctrl+C to stop.", flush=True)
     try:
         while not stop_evt.is_set():
             time.sleep(0.5)
@@ -336,7 +405,9 @@ def main() -> None:
         for thread in threads:
             if thread.ident is not None:
                 thread.join(timeout=2.0)
-        print("[LSL] Stopped.")
+                if thread.is_alive():
+                    print(f"[LSL] Warning: {thread.name} did not exit within 2s.", flush=True)
+        print("[LSL] Stopped.", flush=True)
 
 
 if __name__ == "__main__":
