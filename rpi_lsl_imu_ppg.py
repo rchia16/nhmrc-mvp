@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Publish only IMU and PPG data to Lab Streaming Layer.
+Publish BNO085 IMU and PPG data to Lab Streaming Layer.
 
 Streams:
   NHMRC_IMU: utc_unix_s plus configurable BNO085 9-DoF channels
@@ -17,6 +17,7 @@ import math
 import signal
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -25,6 +26,9 @@ import max30102
 from pylsl import StreamInfo, StreamOutlet, local_clock
 
 from config import deep_get, load_config
+
+
+I2C_LOCK = threading.Lock()
 
 
 @dataclass
@@ -90,21 +94,31 @@ class BNO085LSLIMUPublisher:
 
     def start(self) -> None:
         board, busio, BNO08X_I2C, bno08x, _, _, _ = require_modules()
-        i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
-        self.bno = BNO08X_I2C(i2c, address=self.address, debug=self.debug)
 
         enabled_reports: list[ReportSpec] = []
-        for report in selected_reports(self.report_names):
-            feature_id = getattr(bno08x, report.feature_const, None)
-            if feature_id is None:
-                print(f"[LSL][IMU] skipping {report.name}: missing {report.feature_const}")
-                continue
-            try:
-                self.bno.enable_feature(feature_id, report.default_interval_us)
-            except Exception as e:
-                print(f"[LSL][IMU] skipping {report.name}: could not enable report: {e}")
-                continue
-            enabled_reports.append(report)
+        with I2C_LOCK:
+            i2c = busio.I2C(board.SCL, board.SDA, frequency=self.i2c_frequency)
+            for attempt in range(1, 4):
+                try:
+                    self.bno = BNO08X_I2C(i2c, address=self.address, debug=self.debug)
+                    break
+                except Exception as e:
+                    if attempt >= 3:
+                        raise
+                    print(f"[LSL][IMU] BNO085 init failed on attempt {attempt}/3: {e}; retrying")
+                    time.sleep(0.5)
+
+            for report in selected_reports(self.report_names):
+                feature_id = getattr(bno08x, report.feature_const, None)
+                if feature_id is None:
+                    print(f"[LSL][IMU] skipping {report.name}: missing {report.feature_const}")
+                    continue
+                try:
+                    self.bno.enable_feature(feature_id, report.default_interval_us)
+                except Exception as e:
+                    print(f"[LSL][IMU] skipping {report.name}: could not enable report: {e}")
+                    continue
+                enabled_reports.append(report)
 
         if not enabled_reports:
             raise RuntimeError("No BNO085 reports were enabled for IMU streaming.")
@@ -140,7 +154,8 @@ class BNO085LSLIMUPublisher:
                 row = [time.time()]
                 for report in self.reports:
                     try:
-                        value = getattr(self.bno, report.property_name) if self.bno is not None else None
+                        with I2C_LOCK:
+                            value = getattr(self.bno, report.property_name) if self.bno is not None else None
                         row.extend(report.converter(value))
                     except Exception as e:
                         print(f"[LSL][IMU] read failed for {report.name}: {e}")
@@ -175,16 +190,17 @@ class LSLPPGPublisher:
         self.sensor: Optional[max30102.MAX30102] = None
 
     def start(self) -> None:
-        self.sensor = max30102.MAX30102(gpio_pin=None)
-        self.sensor.setup(
-            led_mode=0x03,
-            sample_rate=200,
-            pulse_width=118,
-            adc_range=4096,
-            fifo_average=1,
-            fifo_rollover=False,
-            fifo_a_full=15,
-        )
+        with I2C_LOCK:
+            self.sensor = max30102.MAX30102(gpio_pin=None)
+            self.sensor.setup(
+                led_mode=0x03,
+                sample_rate=200,
+                pulse_width=118,
+                adc_range=4096,
+                fifo_average=1,
+                fifo_rollover=False,
+                fifo_a_full=15,
+            )
         print("[LSL][PPG] Outlet ready: MAX30102 red/IR")
 
     def stop(self) -> None:
@@ -196,7 +212,8 @@ class LSLPPGPublisher:
             while not stop_evt.is_set():
                 batch = None
                 try:
-                    batch = self.sensor.i2c_thread_func(max_batch=32, require_ppg_rdy=False) if self.sensor else None
+                    with I2C_LOCK:
+                        batch = self.sensor.i2c_thread_func(max_batch=32, require_ppg_rdy=False) if self.sensor else None
                 except Exception as e:
                     print(f"[LSL][PPG] read error: {e}")
 
@@ -213,7 +230,7 @@ class LSLPPGPublisher:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Publish only IMU and PPG to LSL.")
+    ap = argparse.ArgumentParser(description="Publish BNO085 IMU and PPG to LSL.")
     ap.add_argument("--config", default="./streaming_config.yaml")
     ap.add_argument("--imu-stream-name", default=None)
     ap.add_argument("--ppg-stream-name", default=None)
@@ -282,14 +299,17 @@ def main() -> None:
             publisher.run(stop_evt)
         except Exception as e:
             print(f"[LSL][{label}] fatal error: {e}")
+            traceback.print_exc()
             stop_evt.set()
 
     threads = [
         threading.Thread(target=_run_publisher, args=("IMU", imu_pub), daemon=True),
         threading.Thread(target=_run_publisher, args=("PPG", ppg_pub), daemon=True),
     ]
-    for thread in threads:
-        thread.start()
+    threads[0].start()
+    time.sleep(1.0)
+    if not stop_evt.is_set():
+        threads[1].start()
 
     print("[LSL] Streaming BNO085 IMU and PPG. Press Ctrl+C to stop.")
     try:
