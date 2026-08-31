@@ -208,6 +208,8 @@ void ppgBufferRemove();
 uint16_t crc16_ccitt(const uint8_t *data, size_t length);
 
 bool setBnoReports();
+bool beginBnoWithRetry(uint8_t attempts, uint32_t retryDelayMs);
+bool setBnoReportsWithRetry(uint8_t attempts, uint32_t retryDelayMs);
 void serviceBNO();
 bool readPpgFifoSample(uint32_t &red, uint32_t &ir);
 void servicePPG();
@@ -219,6 +221,11 @@ void serviceSerialTx();
 void makeImuStatsPacket(SerialPacketV2 &packet);
 void makePpgStatsPacket(SerialPacketV2 &packet);
 void serviceStats();
+void serviceHeartbeat();
+void serviceHostCommands();
+void startAcquisition();
+void stopAcquisition();
+void discardBufferedSamples();
 
 
 
@@ -262,6 +269,9 @@ uint32_t imuTransmitted = 0;
 uint32_t imuOverflow = 0;
 uint32_t unknownSensorEvents = 0;
 uint32_t bnoResetCount = 0;
+uint32_t bnoReportConfigFailures = 0;
+bool bnoReportsNeedConfig = false;
+uint32_t lastBnoReportRetryMs = 0;
 uint16_t maxImuQueueDepth = 0;
 
 uint32_t ppgReceived = 0;
@@ -274,6 +284,8 @@ uint16_t maxPpgQueueDepth = 0;
 
 uint64_t lastPpgSampleUs = 0;
 uint64_t lastPpgPollUs = 0;
+
+bool acquisitionActive = false;
 
 
 // ============================================================
@@ -393,8 +405,11 @@ uint16_t crc16_ccitt(const uint8_t *data, size_t length) {
 // FATAL ERROR LED
 // ============================================================
 //
-// 2 flashes = BNO085 init/report failure
+// 2 flashes = BNO085 begin_I2C failure after retries
 // 3 flashes = MAX30102 init failure
+//
+// BNO report-enable failures are NOT fatal. They are retried in loop()
+// so PPG/USB streaming can remain alive while the BNO recovers.
 // ============================================================
 
 void fatalBlink(uint8_t flashes) {
@@ -413,25 +428,67 @@ void fatalBlink(uint8_t flashes) {
 
 
 // ============================================================
-// BNO085 REPORT CONFIG
+// BNO085 REPORT CONFIG / RETRY
 // ============================================================
 
 bool setBnoReports() {
-  bool ok = true;
+  // Configure reports individually with a short settling gap.
+  // Re-enabling an already-enabled report is safe and makes reset
+  // recovery much less brittle than treating one transient failure
+  // as a fatal acquisition error.
 
-  if (!bno.enableReport(SH2_ACCELEROMETER, ACCEL_INTERVAL_US)) {
-    ok = false;
+  const bool accOk =
+      bno.enableReport(SH2_ACCELEROMETER, ACCEL_INTERVAL_US);
+
+  delay(5);
+
+  const bool gyroOk =
+      bno.enableReport(
+          SH2_GYROSCOPE_CALIBRATED,
+          GYRO_INTERVAL_US);
+
+  delay(5);
+
+  const bool quatOk =
+      bno.enableReport(
+          SH2_ROTATION_VECTOR,
+          QUAT_INTERVAL_US);
+
+  return accOk && gyroOk && quatOk;
+}
+
+
+bool beginBnoWithRetry(uint8_t attempts,
+                       uint32_t retryDelayMs) {
+  for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+
+    if (bno.begin_I2C(BNO_I2C_ADDRESS, &Wire)) {
+      return true;
+    }
+
+    delay(retryDelayMs);
   }
 
-  if (!bno.enableReport(SH2_GYROSCOPE_CALIBRATED, GYRO_INTERVAL_US)) {
-    ok = false;
+  return false;
+}
+
+
+bool setBnoReportsWithRetry(uint8_t attempts,
+                            uint32_t retryDelayMs) {
+  for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+
+    if (setBnoReports()) {
+      return true;
+    }
+
+    bnoReportConfigFailures++;
+
+    if (retryDelayMs > 0) {
+      delay(retryDelayMs);
+    }
   }
 
-  if (!bno.enableReport(SH2_ROTATION_VECTOR, QUAT_INTERVAL_US)) {
-    ok = false;
-  }
-
-  return ok;
+  return false;
 }
 
 
@@ -552,6 +609,21 @@ uint8_t readPpgOverflowCounter() {
 // ============================================================
 // MAX30102 SERVICE
 // ============================================================
+//
+// Use the SparkFun driver's proven FIFO-drain path:
+//
+//   ppg.check()
+//   ppg.getFIFORed()
+//   ppg.getFIFOIR()
+//   ppg.nextSample()
+//
+// Do NOT use getRed()/getIR() here: those call safeCheck() and can block,
+// which previously throttled both the PPG and BNO085.
+//
+// Samples are still timestamped on the common Pico time_us_64() clock.
+// Because the MAX30102 is configured at 200 Hz, buffered samples are
+// reconstructed at nominal 5000 us spacing with a slow phase correction.
+// ============================================================
 
 void servicePPG() {
   const uint64_t nowUs = time_us_64();
@@ -560,26 +632,31 @@ void servicePPG() {
     return;
   }
 
-  // Timestamp immediately before touching the FIFO.
-  // Every sample currently present must have existed at or before this time.
-  const uint64_t pollStartUs = nowUs;
   lastPpgPollUs = nowUs;
 
-  const uint8_t readPtr = ppg.getReadPointer();
-  const uint8_t writePtr = ppg.getWritePointer();
+  // Pull any hardware-FIFO samples into the SparkFun software FIFO.
+  // The successful standalone sensor test used this exact non-blocking path.
+  ppg.check();
 
-  const uint8_t n =
-      (uint8_t)((writePtr - readPtr) & 0x1F);
+  int availableSamples = ppg.available();
 
-  if (n == 0) {
+  if (availableSamples <= 0) {
     return;
   }
+
+  // The SparkFun software FIFO is small. Under normal operation this will
+  // usually be one sample because servicePPG() is called far faster than 200 Hz.
+  const uint8_t n = (uint8_t)availableSamples;
+
+  // Timestamp immediately after the FIFO check. All samples currently exposed
+  // by available() already existed at or before this point.
+  const uint64_t pollUs = time_us_64();
 
   uint64_t firstSampleUs;
 
   if (lastPpgSampleUs == 0) {
     firstSampleUs =
-        pollStartUs - ((uint64_t)(n - 1) * PPG_INTERVAL_US);
+        pollUs - ((uint64_t)(n - 1) * PPG_INTERVAL_US);
   } else {
     const uint64_t expectedFirstUs =
         lastPpgSampleUs + PPG_INTERVAL_US;
@@ -588,18 +665,21 @@ void servicePPG() {
         expectedFirstUs + ((uint64_t)(n - 1) * PPG_INTERVAL_US);
 
     const int64_t phaseErrorUs =
-        (int64_t)pollStartUs - (int64_t)expectedLatestUs;
+        (int64_t)pollUs - (int64_t)expectedLatestUs;
 
     if (phaseErrorUs > (int64_t)PPG_REANCHOR_US ||
         phaseErrorUs < -(int64_t)PPG_REANCHOR_US) {
 
-      // Genuine long interruption.
+      // Genuine long interruption: re-anchor the newest buffered sample
+      // close to the current Pico clock.
       firstSampleUs =
-          pollStartUs - ((uint64_t)(n - 1) * PPG_INTERVAL_US);
+          pollUs - ((uint64_t)(n - 1) * PPG_INTERVAL_US);
 
       ppgReanchorCount++;
 
     } else {
+      // Slowly correct sensor/Pico oscillator mismatch while preventing
+      // FIFO polling jitter from directly becoming timestamp jitter.
       int64_t correctionUs =
           phaseErrorUs / PPG_PHASE_DIVISOR;
 
@@ -623,24 +703,21 @@ void servicePPG() {
     }
   }
 
-  uint8_t successfullyRead = 0;
-
-  for (uint8_t i = 0; i < n; i++) {
-    uint32_t red = 0;
-    uint32_t ir = 0;
-
-    if (!readPpgFifoSample(red, ir)) {
-      ppgReadErrors++;
+  for (uint8_t i = 0; i < n; ++i) {
+    if (ppg.available() <= 0) {
       break;
     }
 
     PpgEvent event{};
 
+    // IMPORTANT: FIFO getters only read the already-buffered sample.
+    // They do not call safeCheck(), so they do not block waiting for data.
+    event.red = ppg.getFIFORed();
+    event.ir  = ppg.getFIFOIR();
+
     event.sample_timestamp_us =
         firstSampleUs + ((uint64_t)i * PPG_INTERVAL_US);
 
-    event.red = red;
-    event.ir = ir;
     event.sample_index = ppgSampleIndex++;
 
     ppgReceived++;
@@ -648,13 +725,10 @@ void servicePPG() {
     ppgBufferPush(event);
 
     lastPpgSampleUs = event.sample_timestamp_us;
-    successfullyRead++;
-  }
 
-  // If a read failed part-way through, the successful reads have already
-  // advanced the MAX30102 hardware read pointer. The remaining samples
-  // stay in the FIFO and will be retried next service call.
-  (void)successfullyRead;
+    // Advance SparkFun's software FIFO to the next already-buffered sample.
+    ppg.nextSample();
+  }
 }
 
 
@@ -752,10 +826,9 @@ void serviceSerialTx() {
 
   while (sentThisCall < MAX_TX_PACKETS_PER_SERVICE) {
 
-    if (Serial.availableForWrite() <
-        (int)sizeof(SerialPacketV2)) {
-      break;
-    }
+    // Do not gate transmission on DTR or availableForWrite().
+    // Serial.ignoreFlowControl(true) lets Serial.write() operate without
+    // depending on the host's virtual modem-control state.
 
     ImuEvent imuEvent{};
     PpgEvent ppgEvent{};
@@ -775,12 +848,18 @@ void serviceSerialTx() {
          imuEvent.sample_timestamp_us <=
              ppgEvent.sample_timestamp_us);
 
+    size_t written = 0;
+
     if (sendImu) {
       makeImuPacket(imuEvent, packet);
 
-      Serial.write(
+      written = Serial.write(
           reinterpret_cast<const uint8_t *>(&packet),
           sizeof(packet));
+
+      if (written != sizeof(packet)) {
+        break;
+      }
 
       imuBufferRemove();
       imuTransmitted++;
@@ -788,9 +867,13 @@ void serviceSerialTx() {
     } else {
       makePpgPacket(ppgEvent, packet);
 
-      Serial.write(
+      written = Serial.write(
           reinterpret_cast<const uint8_t *>(&packet),
           sizeof(packet));
+
+      if (written != sizeof(packet)) {
+        break;
+      }
 
       ppgBufferRemove();
       ppgTransmitted++;
@@ -875,13 +958,6 @@ void serviceStats() {
     return;
   }
 
-  if (Serial.availableForWrite() <
-      (int)sizeof(SerialPacketV2)) {
-    return;
-  }
-
-  lastStatsMs = nowMs;
-
   SerialPacketV2 packet{};
 
   if (sendPpgStatsNext) {
@@ -890,11 +966,122 @@ void serviceStats() {
     makeImuStatsPacket(packet);
   }
 
-  Serial.write(
+  const size_t written = Serial.write(
       reinterpret_cast<const uint8_t *>(&packet),
       sizeof(packet));
 
+  if (written != sizeof(packet)) {
+    return;
+  }
+
+  lastStatsMs = nowMs;
+
   sendPpgStatsNext = !sendPpgStatsNext;
+}
+
+
+// ============================================================
+// NORMAL-OPERATION LED HEARTBEAT
+// ============================================================
+
+void serviceHeartbeat() {
+  static uint32_t lastHeartbeatMs = 0;
+
+  const uint32_t nowMs = millis();
+
+  if ((uint32_t)(nowMs - lastHeartbeatMs) >= 500) {
+    lastHeartbeatMs = nowMs;
+    digitalWrite(
+        LED_BUILTIN,
+        !digitalRead(LED_BUILTIN));
+  }
+}
+
+
+
+// ============================================================
+// HOST START / STOP CONTROL
+// ============================================================
+//
+// RX commands are one byte and travel in the opposite USB direction from
+// the binary sensor stream:
+//
+//   'S' = start a fresh acquisition session
+//   'X' = stop transmission / discard queued samples
+//
+// No ASCII is ever written back to the host.
+//
+// This gives every RPi recording a clean boundary:
+//   - no stale pre-connection packets
+//   - packet/sample counters start at zero
+//   - ring-overflow counters start at zero
+//   - MAX30102 FIFO is cleared immediately before streaming
+// ============================================================
+
+void discardBufferedSamples() {
+  imuTail = imuHead;
+  ppgTail = ppgHead;
+}
+
+
+void stopAcquisition() {
+  acquisitionActive = false;
+  discardBufferedSamples();
+}
+
+
+void startAcquisition() {
+  acquisitionActive = false;
+
+  // Drop anything accumulated before the host requested a recording.
+  imuHead = 0;
+  imuTail = 0;
+  ppgHead = 0;
+  ppgTail = 0;
+
+  // Session-local transport/drop diagnostics.
+  packetSequence = 0;
+
+  imuReceived = 0;
+  imuTransmitted = 0;
+  imuOverflow = 0;
+  unknownSensorEvents = 0;
+  bnoResetCount = 0;
+  maxImuQueueDepth = 0;
+
+  ppgReceived = 0;
+  ppgTransmitted = 0;
+  ppgOverflow = 0;
+  ppgSampleIndex = 0;
+  ppgReanchorCount = 0;
+  ppgReadErrors = 0;
+  maxPpgQueueDepth = 0;
+
+  // Empty SparkFun's software FIFO first.
+  while (ppg.available() > 0) {
+    ppg.nextSample();
+  }
+
+  // Then reset the MAX30102 hardware FIFO pointers and overflow counter.
+  ppg.clearFIFO();
+
+  lastPpgSampleUs = 0;
+  lastPpgPollUs = time_us_64();
+
+  acquisitionActive = true;
+}
+
+
+void serviceHostCommands() {
+  while (Serial.available() > 0) {
+    const int c = Serial.read();
+
+    if (c == 'S') {
+      startAcquisition();
+    } else if (c == 'X') {
+      stopAcquisition();
+    }
+  }
 }
 
 
@@ -913,6 +1100,9 @@ void setup() {
   // 500000 preserves host-side command compatibility.
   Serial.begin(500000);
 
+  // Native USB CDC: do not require DTR/RTS from the host.
+  Serial.ignoreFlowControl(true);
+
   // --------------------------
   // BNO085 on I2C0 / Wire
   // --------------------------
@@ -922,32 +1112,47 @@ void setup() {
   Wire.begin();
   Wire.setClock(400000);
 
-  if (!bno.begin_I2C(BNO_I2C_ADDRESS, &Wire)) {
+  // Give the bus and sensor supply a short settling period.
+  delay(50);
+
+  // A two-flash fatal pattern now means ONLY that begin_I2C failed
+  // repeatedly. This makes the LED diagnostic unambiguous.
+  if (!beginBnoWithRetry(3, 100)) {
     fatalBlink(2);
   }
 
   Wire.setClock(400000);
 
-  if (!setBnoReports()) {
-    fatalBlink(2);
+  // The BNO can transiently reject a feature command immediately after
+  // reset. Try several times. If configuration still fails, do NOT kill
+  // PPG/USB acquisition: keep retrying from loop().
+  delay(100);
+
+  if (!setBnoReportsWithRetry(5, 50)) {
+    bnoReportsNeedConfig = true;
+    lastBnoReportRetryMs = millis();
   }
 
   // --------------------------
   // MAX30102 on I2C1 / Wire1
   // --------------------------
   //
-  // SparkFun begin() calls Wire1.begin() internally. The Pico pin
-  // assignment therefore must be made BEFORE ppg.begin().
+  // Pin assignment is made before Wire1.begin(). We explicitly start
+  // I2C1 here using the same configuration verified by the sensor test.
   // --------------------------
 
   Wire1.setSDA(PPG_SDA_PIN);
   Wire1.setSCL(PPG_SCL_PIN);
+  Wire1.begin();
+  Wire1.setClock(400000);
 
   if (!ppg.begin(Wire1,
                  I2C_SPEED_FAST,
                  PPG_I2C_ADDRESS)) {
     fatalBlink(3);
   }
+
+  Wire1.setClock(400000);
 
   ppg.setup(
       PPG_LED_BRIGHTNESS,
@@ -957,9 +1162,10 @@ void setup() {
       PPG_PULSE_WIDTH_US,
       PPG_ADC_RANGE);
 
-  // Match the previous Raspberry Pi configuration:
-  // FIFO averaging = 1, rollover disabled.
-  ppg.disableFIFORollover();
+  // Keep FIFO rollover enabled as a fail-safe. Normal operation drains
+  // the FIFO continuously, but rollover prevents a disconnected/slow host
+  // from leaving the MAX30102 permanently stuck in a full FIFO state.
+  ppg.enableFIFORollover();
   ppg.setFIFOAlmostFull(15);
   ppg.clearFIFO();
 
@@ -969,8 +1175,9 @@ void setup() {
 
   lastPpgPollUs = time_us_64();
 
-  // No ASCII startup text is sent. The USB stream is binary-only,
-  // which avoids artificial framing counts at acquisition start.
+  // No ASCII startup text is sent. The USB stream is binary-only.
+  // Transmission begins only after the Raspberry Pi sends 'S'.
+  acquisitionActive = false;
 
   digitalWrite(LED_BUILTIN, HIGH);
 }
@@ -981,25 +1188,55 @@ void setup() {
 // ============================================================
 
 void loop() {
-  // BNO reset recovery.
-  if (bno.wasReset()) {
-    bnoResetCount++;
+  // Always service incoming host control first.
+  serviceHostCommands();
 
-    if (!setBnoReports()) {
-      fatalBlink(2);
+  // BNO reset recovery never halts the PPG/USB side.
+  if (bno.wasReset()) {
+    if (acquisitionActive) {
+      bnoResetCount++;
+    }
+
+    bnoReportsNeedConfig = true;
+    lastBnoReportRetryMs = 0;
+  }
+
+  if (bnoReportsNeedConfig) {
+    const uint32_t nowMs = millis();
+
+    if (lastBnoReportRetryMs == 0 ||
+        (uint32_t)(nowMs - lastBnoReportRetryMs) >= 50) {
+
+      lastBnoReportRetryMs = nowMs;
+
+      if (setBnoReports()) {
+        bnoReportsNeedConfig = false;
+      } else if (acquisitionActive) {
+        bnoReportConfigFailures++;
+      }
     }
   }
 
-  // Keep both sensor paths serviced frequently.
-  serviceBNO();
+  // Keep sensors serviced even while waiting for a host. This prevents
+  // hardware FIFOs from filling, but pre-start samples are discarded below.
+  if (!bnoReportsNeedConfig) {
+    serviceBNO();
+  }
+
   servicePPG();
 
-  // Move a bounded number of oldest timestamped samples to USB.
-  serviceSerialTx();
+  if (acquisitionActive) {
+    serviceSerialTx();
 
-  // Give BNO another opportunity after USB activity.
-  serviceBNO();
+    if (!bnoReportsNeedConfig) {
+      serviceBNO();
+    }
 
-  // Once-per-second diagnostics packets.
-  serviceStats();
+    serviceStats();
+  } else {
+    // Never accumulate stale samples before an explicit START.
+    discardBufferedSamples();
+  }
+
+  serviceHeartbeat();
 }
