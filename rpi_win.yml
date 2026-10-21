@@ -1,0 +1,17 @@
+name: rpi
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - numpy
+  - matplotlib
+  - pandas
+  - opencv
+  - pyyaml
+  - pip
+  - pip:
+      - pylsl
+      - adafruit-blinka
+      - adafruit-circuitpython-bno08x

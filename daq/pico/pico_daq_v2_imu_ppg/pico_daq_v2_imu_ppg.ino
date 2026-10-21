@@ -32,9 +32,9 @@ constexpr uint8_t BNO_SDA_PIN   = 4;
 constexpr uint8_t BNO_SCL_PIN   = 5;
 constexpr uint8_t PPG_SDA_PIN   = 6;
 constexpr uint8_t PPG_SCL_PIN   = 7;
-constexpr uint8_t BNO_RESET_PIN = 8;
+constexpr uint8_t BNO_RESET_PIN = 1; // previously 8
 constexpr uint8_t PPG_INT_PIN   = 9;   // reserved for later
-constexpr uint8_t BNO_INT_PIN   = 13;  // reserved for later
+constexpr uint8_t BNO_INT_PIN   = 0;  // reserved for later, previously 13
 
 constexpr uint8_t BNO_I2C_ADDRESS = 0x4A;
 constexpr uint8_t PPG_I2C_ADDRESS = 0x57;
